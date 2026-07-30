@@ -12,3 +12,6 @@ __pycache__/
 # данные бота
 schedule.txt
 subscribers.txt
+*.db
+*.db-wal
+*.db-shm
