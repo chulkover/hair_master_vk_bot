@@ -10,12 +10,13 @@
   по часам, а не в ответ на сообщение.
 
 Этот файл отвечает только за диалог с клиентом: состояния, клавиатуры,
-тексты. Расписание и хранение данных — в schedule.py, настройки — в config.py.
+тексты. Расписание — в schedule.py, устройство базы — в db.py,
+настройки — в config.py.
 """
 
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import vk_api
 from vk_api.exceptions import ApiError
@@ -23,7 +24,8 @@ from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 
 import config
-import schedule  # наш файл schedule.py — расписание и запись в schedule.txt
+import db       # состояние диалога: чтобы шаг клиента не терялся при перезапуске
+import schedule  # расписание: свободные окошки, записи, подписки
 
 
 # =========================================================================
@@ -70,15 +72,60 @@ SUB_CONFIRM = "SUB_CONFIRM"                # «подписать вас на 31
 
 # Здесь хранится состояние всех пользователей:
 #   {123456: {"state": "SELECTING_LENGTH", "service": "keratin"}, ...}
-# Пока в памяти — при перезапуске бота всё обнулится. Позже перенесём в файл/БД.
+#
+# Это рабочая копия в памяти, а не единственное место хранения: то же состояние
+# лежит в базе, поэтому перезапуск бота не сбивает клиента с его шага. Копия
+# нужна именно потому, что get_user() отдаёт словарь, который вызывающий код
+# меняет по месту («user["service"] = key»), и таких мест десятки. Если каждый
+# вызов поднимал бы из базы свежий словарь, правки терялись бы между вызовами
+# внутри одного сообщения.
+#
+# Из этого следует, что база сама о правках не узнает: сохранение вызывается
+# явно — см. save_user() и два места, откуда он вызывается.
 users = {}
 
 
 def get_user(user_id):
-    """Вернуть данные пользователя, создав их при первой встрече."""
+    """Вернуть данные пользователя, при первой встрече подняв их из базы."""
     if user_id not in users:
-        users[user_id] = {"state": MAIN_MENU}
+        saved = db.load_dialog(user_id)
+        users[user_id] = revive(saved) if saved else {"state": MAIN_MENU}
     return users[user_id]
+
+
+def revive(saved):
+    """Проверить поднятое из базы состояние: годится ли оно ещё в дело.
+
+    Клиент мог уйти на середине выбора времени и вернуться через неделю —
+    выбранный тогда день уже прошёл, и продолжать с него некуда. В таком
+    случае честнее начать с меню, чем предлагать вчерашние окошки.
+    """
+    today = date.today().isoformat()
+
+    for field in ("day", "sub_day"):
+        chosen = saved.get(field)
+        if chosen is not None and chosen < today:
+            return {"state": MAIN_MENU}
+
+    return saved
+
+
+def save_user(user_id):
+    """Запомнить состояние клиента в базе.
+
+    В главном меню строку не храним, а удаляем: там состояние ничем не
+    отличается от того, что get_user() выдаёт при первой встрече, а лишние
+    поля от прошлого расчёта всё равно перезаписываются раньше, чем
+    понадобятся. Так в таблице лежат только те, кто сейчас посреди диалога.
+    """
+    user = users.get(user_id)
+    if user is None:
+        return  # до get_user() дело не дошло — сохранять нечего
+
+    if user["state"] == MAIN_MENU:
+        db.forget_dialog(user_id)
+    else:
+        db.save_dialog(user_id, user)
 
 
 # =========================================================================
@@ -809,6 +856,11 @@ def offer_free_slot(subscriber_id, subscription):
     # снимется сама — save_booking() это уже делает.
     ask_time(subscriber_id, subscription["date"])
 
+    # Единственное место, где состояние диалога меняет фоновый поток, а не
+    # ответ на сообщение. Без этой строки уведомление переживало бы перезапуск,
+    # а шаг, на который оно клиента поставило, — нет.
+    save_user(subscriber_id)
+
 
 def notify_subscribers(cancelled):
     """Рассказать подписчикам дня, что запись отменили и время открылось.
@@ -1361,3 +1413,12 @@ for event in longpoll.listen():
                 print(f"VK вернул ошибку: {error}")
         except Exception as error:
             print(f"Ошибка при обработке сообщения: {error}")
+
+        # Здесь, а не внутри handle_message(): у того около двадцати выходов,
+        # и сохранение пришлось бы дописывать в каждый. И именно после
+        # try/except — если обработка сломалась на середине, состояние уже
+        # могло измениться, и записать его надо всё равно.
+        try:
+            save_user(event.user_id)
+        except Exception as error:
+            print(f"Не смогла сохранить состояние диалога: {error}")
