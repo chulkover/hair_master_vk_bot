@@ -1,4 +1,4 @@
-"""Расписание мастера: свободные окошки и хранение записей в schedule.txt.
+"""Расписание мастера: свободные окошки и записи клиентов.
 
 Главная идея файла: время внутри модуля считаем в МИНУТАХ ОТ НАЧАЛА СУТОК.
     "10:00" -> 600
@@ -8,6 +8,10 @@
 
 Дата хранится строкой "2026-08-03" — год-месяц-день. Такой формат удобен тем,
 что строки в нём сортируются как даты, и его же понимает datetime.
+
+Записи лежат в базе (db.py), подписки пока в subscribers.txt — это раздел 6,
+он переедет следующим. Наружу разница не видна: main.py как и раньше получает
+словари с теми же ключами и не знает, откуда они пришли.
 """
 
 import threading
@@ -15,39 +19,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import config
-
-# Файл трогают два потока: диалог с клиентами и фоновый планировщик.
-# Любая правка — это «прочитать всё, изменить, записать всё», и если два
-# потока сделают это одновременно, тот, кто записал последним, затрёт чужое
-# изменение. Поэтому такие места целиком идут под этим замком.
-#
-# Замок берут только функции, которые МЕНЯЮТ файл. Чтению он не нужен:
-# save_all() подменяет файл целиком и одним движением (см. ниже), так что
-# читатель всегда видит либо старое состояние, либо новое, но не половину.
-FILE_LOCK = threading.Lock()
-
-# Файл лежит рядом с кодом, а не в рабочем каталоге запуска.
-SCHEDULE_FILE = Path(__file__).parent / "schedule.txt"
-
-# Порядок колонок в файле: одна запись — одна строка, поля разделены «|».
-# Символ выбран такой, потому что его точно не будет внутри самих значений.
-FIELDS = [
-    "id",          # порядковый номер записи, пригодится для отмены
-    "user_id",     # VK ID клиента
-    "date",        # 2026-08-03
-    "start",       # 14:00 — начало процедуры
-    "minutes",     # длительность самой процедуры, без уборки
-    "service",     # ключ услуги: keratin / botox / cold
-    "length",      # ключ длины волос
-    "density",     # ключ густоты
-    "price_from",
-    "price_to",
-    "status",
-]
-
-# Первая строка файла — подсказка для человека, который откроет schedule.txt.
-# При чтении мы её пропускаем, потому что она начинается с «#».
-HEADER = "# " + "|".join(FIELDS)
+import db
 
 # Жизнь записи по статусам:
 #   NEW       — клиент записался, подтверждения ещё не спрашивали;
@@ -57,8 +29,11 @@ HEADER = "# " + "|".join(FIELDS)
 #   EXPIRED   — отменилась сама, подтверждения так и не было.
 #
 # Первые три занимают время в расписании, последние два — нет: окошко снова
-# свободно. Отмену клиента и автоотмену различаем, чтобы мастер по файлу
-# видел, что произошло: «передумал» и «не выходит на связь» — разные истории.
+# свободно. Отмену клиента и автоотмену различаем, чтобы в истории было видно,
+# что произошло: «передумал» и «не выходит на связь» — разные истории.
+#
+# Набор статусов повторён в схеме базы (CHECK у колонки status): база не даст
+# записать статус, которого здесь нет.
 ACTIVE_STATUSES = ("NEW", "REMINDED", "CONFIRMED")
 
 # Статусы, из которых запись ещё можно подтвердить.
@@ -109,67 +84,62 @@ def end_time(booking):
     return to_time(to_minutes(booking["start"]) + booking["minutes"])
 
 
-# =========================================================================
-# 2. Файл: чтение и запись
-# =========================================================================
+def moment_key(moment):
+    """datetime -> "2026-08-03 14:00" — момент времени в том виде, как в базе.
 
-def read_all():
-    """Прочитать все записи из schedule.txt в список словарей."""
-    if not SCHEDULE_FILE.exists():
-        return []  # файла ещё нет — значит, записей тоже нет
-
-    bookings = []
-    for line in SCHEDULE_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue  # пустая строка или комментарий
-
-        values = line.split("|")
-        if len(values) != len(FIELDS):
-            # Файл кто-то поправил руками и сломал. Не падаем из-за одной
-            # строки: жалуемся в консоль и работаем с остальными.
-            print(f"schedule.txt: пропускаю непонятную строку: {line}")
-            continue
-
-        # Порядок значений в строке совпадает с FIELDS — отсюда и словарь.
-        booking = dict(zip(FIELDS, values))
-
-        # Из файла всё приходит строками — числа переводим обратно в int.
-        booking["user_id"] = int(booking["user_id"])
-        booking["minutes"] = int(booking["minutes"])
-        bookings.append(booking)
-
-    return bookings
-
-
-def write_lines(path, lines):
-    """Записать файл целиком — так, чтобы читатель не увидел его недописанным.
-
-    Обычная запись сначала обнуляет файл, а потом наполняет его заново, и в
-    этот момент кто-то другой (у нас — фоновый планировщик) может прочитать
-    пустоту или половину строк. Поэтому пишем в файл-времянку рядом и одним
-    движением ставим её на место готового: replace() либо срабатывает целиком,
-    либо не срабатывает вовсе. Бонусом файл не пострадает, если бот упадёт
-    посреди записи.
+    Дата и время лежат в отдельных колонках, но склеенные через пробел они
+    сравниваются как настоящее время: "2026-08-03 09:00" меньше, чем
+    "2026-08-03 14:00", а оно меньше, чем любое время 4 августа. Поэтому
+    «будущие записи» в запросе — это date || ' ' || start > сейчас, и
+    вытаскивать прошедшие из базы, чтобы тут же их отбросить, не нужно.
     """
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    temp.replace(path)
+    return moment.strftime("%Y-%m-%d %H:%M")
 
 
-def save_all(bookings):
-    """Перезаписать файл целиком списком записей."""
-    lines = [HEADER]
-    for booking in bookings:
-        lines.append("|".join(str(booking[field]) for field in FIELDS))
-    write_lines(SCHEDULE_FILE, lines)
+# =========================================================================
+# 2. База: откуда берутся записи
+# =========================================================================
+# Все запросы к таблице bookings живут в этом файле и ниже. Про SQL знает
+# только schedule.py, main.py по-прежнему получает словари.
+#
+# Имена колонок совпадают с ключами словарей, поэтому SELECT * — это уже
+# готовая запись: перекладывать значения по одному не нужно.
+
+def placeholders(values):
+    """"?, ?, ?" под IN (...) — по одному вопросу на значение.
+
+    Сами значения уходят параметрами запроса, а не подставляются в текст:
+    так их не нужно ни экранировать, ни бояться.
+    """
+    return ", ".join("?" * len(values))
 
 
-def next_id(bookings):
-    """Следующий свободный номер записи."""
-    if not bookings:
-        return 1
-    return max(int(booking["id"]) for booking in bookings) + 1
+def bookings_on(day):
+    """Все записи одного дня — из них считается занятость времени.
+
+    Отменённые тоже приходят: их отбрасывает busy_intervals(), которому всё
+    равно, откуда пришёл список. Записей в одном дне единицы, отбирать их
+    ещё и запросом смысла нет.
+    """
+    return db.query("SELECT * FROM bookings WHERE date = ?", (day,))
+
+
+def bookings_ahead():
+    """Записи на весь период, на который открыта запись.
+
+    Перебор свободных дней (work_days, busy_days) спрашивает базу один раз,
+    а не по разу на каждый день. История при этом не мешается: полгода
+    прошедших записей остаются в базе, но в этот запрос не попадают.
+    """
+    today = date.today()
+    last = today + timedelta(days=config.DAYS_AHEAD)
+    return db.query("SELECT * FROM bookings WHERE date BETWEEN ? AND ?",
+                    (today.isoformat(), last.isoformat()))
+
+
+def get_booking(booking_id):
+    """Запись по номеру или None, если такой нет."""
+    return db.query_one("SELECT * FROM bookings WHERE id = ?", (booking_id,))
 
 
 # =========================================================================
@@ -245,11 +215,11 @@ def earliest_start(day):
 def free_slots(day, minutes, bookings=None):
     """Список свободных начал процедуры в этот день: ["10:00", "10:30", ...].
 
-    bookings можно передать снаружи, чтобы не перечитывать файл
-    на каждый день, когда мы проверяем сразу две недели вперёд.
+    bookings можно передать снаружи, чтобы не спрашивать базу на каждый день,
+    когда мы проверяем сразу две недели вперёд.
     """
     if bookings is None:
-        bookings = read_all()
+        bookings = bookings_on(day)
 
     slots = []
     start = earliest_start(day)
@@ -269,7 +239,7 @@ def work_days(minutes):
     Возвращает список строк-дат. Дни без окон в список не попадают —
     нет смысла показывать кнопку, за которой пусто.
     """
-    bookings = read_all()  # читаем файл один раз на весь перебор
+    bookings = bookings_ahead()  # один запрос на весь перебор
     days = []
     today = date.today()
 
@@ -299,7 +269,7 @@ def busy_days(minutes):
     Сегодня в список не попадает (range начинается с 1): даже если кто-то
     отменится через час, запас MIN_LEAD_MINUTES до конца дня уже не влезет.
     """
-    bookings = read_all()
+    bookings = bookings_ahead()
     days = []
     today = date.today()
 
@@ -326,76 +296,92 @@ def busy_days(minutes):
 
 def create_booking(user_id, day, start, minutes, service, length, density,
                    price_from, price_to):
-    """Проверить, что время свободно, и дописать запись в файл.
+    """Проверить, что время свободно, и добавить запись.
 
     Возвращает саму запись — или None, если окошко уже заняли.
 
     Проверка делается здесь, в момент создания, а не когда клиент только
-    увидел кнопку: пока он думал, время мог занять кто-то другой.
+    увидел кнопку: пока он думал, время мог занять кто-то другой. Проверка и
+    вставка идут одной транзакцией: между «время свободно» и «записала» не
+    должен влезть второй клиент с тем же окошком.
     """
-    with FILE_LOCK:
-        bookings = read_all()  # свежее состояние файла, а не минутной давности
+    booking = {
+        "user_id": user_id,
+        "date": day,
+        "start": start,
+        "minutes": minutes,
+        "service": service,
+        "length": length,
+        "density": density,
+        "price_from": price_from,
+        "price_to": price_to,
+        "status": "NEW",
+    }
 
-        if not is_free(bookings, day, to_minutes(start), minutes):
+    # Записался в последний момент — подтверждать нечего: клиент только что
+    # сам выбрал это время. Спрашивать «придёте?» сразу после «готово,
+    # записала» глупо, да и напоминать уже не за сутки.
+    if minutes_left(booking) <= config.CONFIRM_BEFORE_HOURS * 60:
+        booking["status"] = "CONFIRMED"
+
+    columns = ["user_id", "date", "start", "minutes", "service", "length",
+               "density", "price_from", "price_to", "status"]
+
+    with db.transaction():
+        if not is_free(bookings_on(day), day, to_minutes(start), minutes):
             return None
 
-        booking = {
-            "id": next_id(bookings),
-            "user_id": user_id,
-            "date": day,
-            "start": start,
-            "minutes": minutes,
-            "service": service,
-            "length": length,
-            "density": density,
-            "price_from": price_from,
-            "price_to": price_to,
-            "status": "NEW",
-        }
+        # Номер выдаёт база, поэтому он появляется в записи только сейчас.
+        booking["id"] = db.insert(
+            f"INSERT INTO bookings ({', '.join(columns)}) "
+            f"VALUES ({placeholders(columns)})",
+            [booking[column] for column in columns],
+        )
 
-        # Записался в последний момент — подтверждать нечего: клиент только
-        # что сам выбрал это время. Спрашивать «придёте?» сразу после
-        # «готово, записала» глупо, да и напоминать уже не за сутки.
-        if minutes_left(booking) <= config.CONFIRM_BEFORE_HOURS * 60:
-            booking["status"] = "CONFIRMED"
-
-        bookings.append(booking)
-        save_all(bookings)
-        return booking
+    return booking
 
 
 # =========================================================================
 # 5. Записи клиента и отмена
 # =========================================================================
 
-def user_bookings(user_id, only_future=True):
-    """Активные записи одного клиента, по возрастанию даты.
+def active_condition(only_future=True):
+    """Условие «активная запись клиента» и значения к нему.
 
-    only_future=True — показываем только то, что ещё не началось:
-    прошлую процедуру отменять уже поздно.
+    Отбор одинаков у списка записей и у их подсчёта, а держать его в двух
+    запросах — это два места, где можно разойтись. Возвращаем кусок SQL и
+    параметры к нему, чтобы условие было написано один раз.
     """
-    bookings = []
-    for booking in read_all():
-        if booking["user_id"] != user_id:
-            continue
-        if booking["status"] not in ACTIVE_STATUSES:
-            continue
-        if only_future and booking_datetime(booking) <= datetime.now():
-            continue
-        bookings.append(booking)
+    sql = f"user_id = ? AND status IN ({placeholders(ACTIVE_STATUSES)})"
+    params = ACTIVE_STATUSES
 
-    # Порядок в файле произвольный, клиенту нужен по времени начала.
-    bookings.sort(key=booking_datetime)
-    return bookings
+    if only_future:
+        # Прошлую процедуру отменять уже поздно, и в лимит она не идёт.
+        sql += " AND date || ' ' || start > ?"
+        params += (moment_key(datetime.now()),)
+
+    return sql, params
+
+
+def user_bookings(user_id, only_future=True):
+    """Активные записи одного клиента, по возрастанию даты."""
+    condition, params = active_condition(only_future)
+    return db.query(
+        f"SELECT * FROM bookings WHERE {condition} ORDER BY date, start",
+        (user_id,) + params,
+    )
 
 
 def active_count(user_id):
     """Сколько активных записей у клиента сейчас — это и есть его счётчик.
 
-    Считать отдельно ничего не надо: user_bookings() уже отбрасывает
-    отменённые и прошедшие записи. Прошла процедура — счётчик сам уменьшился.
+    Считает база: вытаскивать записи, чтобы тут же их посчитать, незачем.
+    Прошла процедура — счётчик уменьшился сам, отдельно её нигде не закрываем.
     """
-    return len(user_bookings(user_id))
+    condition, params = active_condition()
+    row = db.query_one(f"SELECT count(*) AS n FROM bookings WHERE {condition}",
+                       (user_id,) + params)
+    return row["n"]
 
 
 def limit_reached(user_id):
@@ -406,43 +392,48 @@ def limit_reached(user_id):
 def cancel_booking(booking_id, user_id):
     """Отменить запись клиента. Возвращает запись или None, если не нашли.
 
-    Строку из файла НЕ удаляем, а меняем статус на CANCELLED. Так у мастера
-    остаётся история отмен, а расписание про эту запись сразу забывает:
-    busy_intervals() берёт только ACTIVE_STATUSES, значит время снова свободно.
+    Строку НЕ удаляем, а меняем статус на CANCELLED. Так у мастера остаётся
+    история отмен, а расписание про эту запись сразу забывает: busy_intervals()
+    берёт только ACTIVE_STATUSES, значит время снова свободно.
 
-    user_id тут не для красоты: он гарантирует, что клиент отменяет
-    свою запись, а не чужую.
+    user_id тут не для красоты: он гарантирует, что клиент отменяет свою
+    запись, а не чужую. Все условия — в самом UPDATE, поэтому чужая запись,
+    уже отменённая или несуществующая дают один и тот же ответ: ноль
+    изменённых строк, то есть None. Читать базу дважды для этого не нужно.
     """
-    with FILE_LOCK:
-        bookings = read_all()
+    changed = db.execute(
+        f"UPDATE bookings SET status = 'CANCELLED' "
+        f"WHERE id = ? AND user_id = ? "
+        f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
+        (booking_id, user_id) + ACTIVE_STATUSES,
+    )
 
-        for booking in bookings:
-            # id из файла приходит строкой, поэтому сравниваем как строки
-            if str(booking["id"]) != str(booking_id):
-                continue
-            if booking["user_id"] != user_id:
-                continue
-            if booking["status"] not in ACTIVE_STATUSES:
-                return None  # уже отменена — второй раз отменять нечего
-
-            booking["status"] = "CANCELLED"
-            save_all(bookings)
-            return booking
-
+    if not changed:
         return None
+
+    return get_booking(booking_id)
 
 
 # =========================================================================
 # 6. Подписки на свободные окошки
 # =========================================================================
 # Клиент выбрал день, а времени в нём нет — он подписывается и ждёт, пока
-# кто-нибудь отменится. Храним рядом с расписанием и в том же формате:
-# одна подписка — одна строка, поля через «|».
+# кто-нибудь отменится.
 #
 # Параметры процедуры лежат в самой подписке, а не в памяти бота. Иначе
 # после перезапуска мы бы знали, кого уведомить, но не знали бы, какое
 # окошко ему подходит и по какой цене он считал.
+#
+# Этот раздел ещё живёт в файле: одна подписка — одна строка, поля через «|».
+# Место в базе для него уже готово (таблица subscriptions), переезд — следующим
+# шагом. Пока подписки в файле, вместе с ними остаётся и замок: правка файла
+# — это «прочитать всё, изменить, записать всё», и два потока (диалог и
+# планировщик) без замка затрут изменения друг друга. Записям он больше не
+# нужен, там неразрывность обеспечивает сама база.
 
+FILE_LOCK = threading.Lock()
+
+# Файл лежит рядом с кодом, а не в рабочем каталоге запуска.
 SUBSCRIBERS_FILE = Path(__file__).parent / "subscribers.txt"
 
 SUB_FIELDS = [
@@ -495,6 +486,21 @@ def read_subscriptions():
     return subscriptions
 
 
+def write_lines(path, lines):
+    """Записать файл целиком — так, чтобы читатель не увидел его недописанным.
+
+    Обычная запись сначала обнуляет файл, а потом наполняет его заново, и в
+    этот момент кто-то другой (у нас — фоновый планировщик) может прочитать
+    пустоту или половину строк. Поэтому пишем в файл-времянку рядом и одним
+    движением ставим её на место готового: replace() либо срабатывает целиком,
+    либо не срабатывает вовсе. Бонусом файл не пострадает, если бот упадёт
+    посреди записи.
+    """
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temp.replace(path)
+
+
 def save_subscriptions(subscriptions):
     """Перезаписать файл подписок целиком."""
     lines = [SUB_HEADER]
@@ -527,7 +533,12 @@ def has_bookings(day):
     когда есть чему освобождаться. В дне, где не записан никто, время
     и так открыто целиком — подписываться там не на что.
     """
-    return bool(busy_intervals(read_all(), day))
+    row = db.query_one(
+        f"SELECT count(*) AS n FROM bookings WHERE date = ? "
+        f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
+        (day,) + ACTIVE_STATUSES,
+    )
+    return row["n"] > 0
 
 
 def is_subscribed(user_id, day):
@@ -609,33 +620,41 @@ def minutes_left(booking):
     return int(left.total_seconds() // 60)
 
 
+def due_within(status, hours):
+    """Записи в статусе status, до которых осталось не больше hours.
+
+    Уже начавшиеся не берём: и напоминать, и отменять процедуру, которая
+    вот-вот начнётся или уже идёт, поздно — пусть мастер решает сам.
+    Отсюда «строго больше сейчас» в первом условии.
+    """
+    now = datetime.now()
+    limit = now + timedelta(hours=hours)
+
+    return db.query(
+        "SELECT * FROM bookings WHERE status = ? "
+        "AND date || ' ' || start > ? AND date || ' ' || start <= ? "
+        "ORDER BY date, start",
+        (status, moment_key(now), moment_key(limit)),
+    )
+
+
 def due_reminders():
     """Записи, которым пора напомнить о подтверждении.
 
     Только статус NEW: REMINDED означает, что напоминание уже ушло, и второй
     раз тревожить клиента незачем. Именно поэтому «уже напомнили» живёт в
-    файле, а не в памяти потока — перезапуск бота не должен приводить
+    базе, а не в памяти потока — перезапуск бота не должен приводить
     к повторной рассылке.
     """
-    limit = config.CONFIRM_BEFORE_HOURS * 60
-    return [booking for booking in read_all()
-            if booking["status"] == "NEW" and 0 < minutes_left(booking) <= limit]
+    return due_within("NEW", config.CONFIRM_BEFORE_HOURS)
 
 
 def due_expired():
-    """Записи, которые пора отменить: напоминание ушло, подтверждения нет.
-
-    Записи, до которых время уже дошло (minutes_left <= 0), не трогаем:
-    отменять процедуру, которая вот-вот начнётся или уже идёт, поздно —
-    пусть мастер решает сам.
-    """
+    """Записи, которые пора отменить: напоминание ушло, подтверждения нет."""
     if config.AUTOCANCEL_BEFORE_HOURS is None:
         return []  # автоотмена выключена в настройках
 
-    limit = config.AUTOCANCEL_BEFORE_HOURS * 60
-    return [booking for booking in read_all()
-            if booking["status"] == "REMINDED"
-            and 0 < minutes_left(booking) <= limit]
+    return due_within("REMINDED", config.AUTOCANCEL_BEFORE_HOURS)
 
 
 def set_status(booking_id, new_status, allowed_from):
@@ -643,23 +662,23 @@ def set_status(booking_id, new_status, allowed_from):
 
     None — если записи нет или её статус уже не тот, которого мы ждали:
     например, планировщик собрался отменить запись, а клиент за эту секунду
-    успел её подтвердить. Владельца здесь не проверяем, в отличие от
-    cancel_booking(): статусы меняет бот, а не клиент.
+    успел её подтвердить. Это и есть смысл условия по статусу внутри UPDATE:
+    проверка и запись происходят одним неделимым действием, поэтому «успел» и
+    «не успел» не могут случиться оба сразу.
+
+    Владельца здесь не проверяем, в отличие от cancel_booking(): статусы
+    меняет бот, а не клиент.
     """
-    with FILE_LOCK:
-        bookings = read_all()
+    changed = db.execute(
+        f"UPDATE bookings SET status = ? "
+        f"WHERE id = ? AND status IN ({placeholders(allowed_from)})",
+        (new_status, booking_id) + tuple(allowed_from),
+    )
 
-        for booking in bookings:
-            if str(booking["id"]) != str(booking_id):
-                continue
-            if booking["status"] not in allowed_from:
-                return None
-
-            booking["status"] = new_status
-            save_all(bookings)
-            return booking
-
+    if not changed:
         return None
+
+    return get_booking(booking_id)
 
 
 def mark_reminded(booking_id):
@@ -679,24 +698,32 @@ def confirm_bookings(user_id):
     в ответ на напоминание, и разбираться, к какой записи относилась кнопка
     (а сообщение могло быть и вчерашним), не нужно — обычно запись одна,
     а если их несколько, подтвердить их все и есть то, чего клиент хочет.
+
+    Сначала выбираем, что подтверждать, потом подтверждаем — и то и другое
+    внутри одной транзакции: вернуть клиенту список записей нужно, а между
+    выбором и правкой планировщик не должен успеть отменить одну из них.
     """
-    with FILE_LOCK:
-        bookings = read_all()
-        confirmed = []
+    now = moment_key(datetime.now())
 
-        for booking in bookings:
-            if booking["user_id"] != user_id:
-                continue
-            if booking["status"] not in UNCONFIRMED_STATUSES:
-                continue
-            if minutes_left(booking) <= 0:
-                continue  # прошедшую запись подтверждать нечего
-
-            booking["status"] = "CONFIRMED"
-            confirmed.append(booking)
+    with db.transaction():
+        confirmed = db.query(
+            f"SELECT * FROM bookings WHERE user_id = ? "
+            f"AND status IN ({placeholders(UNCONFIRMED_STATUSES)}) "
+            f"AND date || ' ' || start > ? "  # прошедшую подтверждать нечего
+            f"ORDER BY date, start",
+            (user_id,) + UNCONFIRMED_STATUSES + (now,),
+        )
 
         if confirmed:
-            save_all(bookings)
+            ids = [booking["id"] for booking in confirmed]
+            db.execute(
+                f"UPDATE bookings SET status = 'CONFIRMED' "
+                f"WHERE id IN ({placeholders(ids)})",
+                ids,
+            )
 
-        confirmed.sort(key=booking_datetime)
-        return confirmed
+    # В базе статус уже новый — поправим и в словарях, которые отдаём наружу.
+    for booking in confirmed:
+        booking["status"] = "CONFIRMED"
+
+    return confirmed

@@ -882,8 +882,10 @@ def show_my_bookings(user_id):
             f"{schedule.pretty_date(booking['date'])}, "
             f"{booking['start']}–{schedule.end_time(booking)}\n"
             f"Стоимость: {booking['price_from']}–{booking['price_to']} ₽\n"
-            # .get, а не [...]: файл мог поправить руками, и неизвестный
-            # статус лучше показать как есть, чем упасть на нём.
+            # .get, а не [...]: неизвестный статус лучше показать как есть,
+            # чем упасть на подписи к нему. База такого не пропустит (CHECK
+            # у колонки status), но сообщение клиенту — не то место, где
+            # стоит падать.
             f"Статус: {STATUS_LABELS.get(booking['status'], booking['status'])}"
         )
     lines.append("\nЧтобы отменить запись, нажмите её номер.")
