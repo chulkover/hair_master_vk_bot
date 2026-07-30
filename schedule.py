@@ -9,14 +9,12 @@
 Дата хранится строкой "2026-08-03" — год-месяц-день. Такой формат удобен тем,
 что строки в нём сортируются как даты, и его же понимает datetime.
 
-Записи лежат в базе (db.py), подписки пока в subscribers.txt — это раздел 6,
-он переедет следующим. Наружу разница не видна: main.py как и раньше получает
-словари с теми же ключами и не знает, откуда они пришли.
+Записи и подписки лежат в базе — весь SQL про них собран здесь, ниже только
+db.py. Наружу это не выходит: main.py получает словари с теми же ключами и не
+знает, откуда они пришли.
 """
 
-import threading
 from datetime import date, datetime, timedelta
-from pathlib import Path
 
 import config
 import db
@@ -424,106 +422,39 @@ def cancel_booking(booking_id, user_id):
 # после перезапуска мы бы знали, кого уведомить, но не знали бы, какое
 # окошко ему подходит и по какой цене он считал.
 #
-# Этот раздел ещё живёт в файле: одна подписка — одна строка, поля через «|».
-# Место в базе для него уже готово (таблица subscriptions), переезд — следующим
-# шагом. Пока подписки в файле, вместе с ними остаётся и замок: правка файла
-# — это «прочитать всё, изменить, записать всё», и два потока (диалог и
-# планировщик) без замка затрут изменения друг друга. Записям он больше не
-# нужен, там неразрывность обеспечивает сама база.
+# Пара «клиент + день» — это первичный ключ таблицы. Дважды подписаться на один
+# день нельзя не потому, что мы это проверили, а потому, что база не даст.
 
-FILE_LOCK = threading.Lock()
-
-# Файл лежит рядом с кодом, а не в рабочем каталоге запуска.
-SUBSCRIBERS_FILE = Path(__file__).parent / "subscribers.txt"
-
-SUB_FIELDS = [
-    "user_id",     # VK ID клиента
-    "date",        # день, окошка в котором он ждёт
-    "minutes",     # длительность процедуры: окно короче не подойдёт
-    "service",
-    "length",
-    "density",
-    "price_from",  # цена на момент подписки — по ней клиент и запишется
-    "price_to",
-]
-
-SUB_HEADER = "# " + "|".join(SUB_FIELDS)
-
-
-def read_subscriptions():
-    """Все живые подписки. Вчерашние молча отбрасываем.
-
-    Подписка живёт до конца своего дня, поэтому отдельного статуса ей не
-    нужно: день прошёл — строка перестала что-либо значить. Из файла она
-    исчезнет при ближайшей записи, save_subscriptions() пишет только живые.
-    """
-    if not SUBSCRIBERS_FILE.exists():
-        return []
-
-    today = date.today().strftime("%Y-%m-%d")
-    subscriptions = []
-
-    for line in SUBSCRIBERS_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        values = line.split("|")
-        if len(values) != len(SUB_FIELDS):
-            print(f"subscribers.txt: пропускаю непонятную строку: {line}")
-            continue
-
-        subscription = dict(zip(SUB_FIELDS, values))
-        subscription["user_id"] = int(subscription["user_id"])
-        subscription["minutes"] = int(subscription["minutes"])
-
-        # Даты в формате «2026-08-03» сравниваются как обычные строки.
-        if subscription["date"] < today:
-            continue
-
-        subscriptions.append(subscription)
-
-    return subscriptions
-
-
-def write_lines(path, lines):
-    """Записать файл целиком — так, чтобы читатель не увидел его недописанным.
-
-    Обычная запись сначала обнуляет файл, а потом наполняет его заново, и в
-    этот момент кто-то другой (у нас — фоновый планировщик) может прочитать
-    пустоту или половину строк. Поэтому пишем в файл-времянку рядом и одним
-    движением ставим её на место готового: replace() либо срабатывает целиком,
-    либо не срабатывает вовсе. Бонусом файл не пострадает, если бот упадёт
-    посреди записи.
-    """
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    temp.replace(path)
-
-
-def save_subscriptions(subscriptions):
-    """Перезаписать файл подписок целиком."""
-    lines = [SUB_HEADER]
-    for subscription in subscriptions:
-        lines.append("|".join(str(subscription[field]) for field in SUB_FIELDS))
-    write_lines(SUBSCRIBERS_FILE, lines)
-
+# Прошедшие подписки в выдачу не попадают («date >= сегодня»), но и не удаляются
+# на месте: строка просто перестала что-либо значить, а убирает её db.cleanup().
+# Статус подписке поэтому не нужен.
 
 def user_subscriptions(user_id):
     """Подписки одного клиента, по возрастанию даты."""
-    subscriptions = [s for s in read_subscriptions() if s["user_id"] == user_id]
-    subscriptions.sort(key=lambda subscription: subscription["date"])
-    return subscriptions
+    return db.query(
+        "SELECT * FROM subscriptions WHERE user_id = ? AND date >= ? "
+        "ORDER BY date",
+        (user_id, date.today().isoformat()),
+    )
+
+
+def subscriptions_count(user_id):
+    """Сколько дней клиент сейчас ждёт."""
+    row = db.query_one(
+        "SELECT count(*) AS n FROM subscriptions "
+        "WHERE user_id = ? AND date >= ?",
+        (user_id, date.today().isoformat()),
+    )
+    return row["n"]
 
 
 def day_subscribers(day):
     """Все, кто ждёт окошко в этот день.
 
-    Порядок оставляем как в файле — то есть по времени подписки. Никакой
-    очереди это не создаёт (окошко не бронируется), но при рассылке
-    уведомление первым уходит тому, кто ждёт дольше всех.
+    Порядок не задаём: уведомление уходит всем подходящим сразу, окошко ни за
+    кем не бронируется — кто первый запишется, того и место.
     """
-    return [s for s in read_subscriptions() if s["date"] == day]
+    return db.query("SELECT * FROM subscriptions WHERE date = ?", (day,))
 
 
 def has_bookings(day):
@@ -543,12 +474,15 @@ def has_bookings(day):
 
 def is_subscribed(user_id, day):
     """Клиент уже ждёт окошко в этот день?"""
-    return any(s["date"] == day for s in user_subscriptions(user_id))
+    return db.query_one(
+        "SELECT 1 FROM subscriptions WHERE user_id = ? AND date = ?",
+        (user_id, day),
+    ) is not None
 
 
 def subscriptions_limit_reached(user_id):
     """Клиент уже набрал максимум подписок?"""
-    return len(user_subscriptions(user_id)) >= config.MAX_SUBSCRIPTIONS
+    return subscriptions_count(user_id) >= config.MAX_SUBSCRIPTIONS
 
 
 def add_subscription(user_id, day, minutes, service, length, density,
@@ -558,30 +492,37 @@ def add_subscription(user_id, day, minutes, service, length, density,
     None — если он уже подписан на этот день или упёрся в лимит. Проверки
     здесь же, а не только в диалоге: между показом кнопки и нажатием клиент
     мог подписаться с другого устройства.
+
+    Про «уже подписан» отвечает сама вставка: пара «клиент + день» — первичный
+    ключ, и OR IGNORE превращает попытку добавить дубль в ноль изменённых
+    строк. Лимит же приходится считать отдельно, поэтому подсчёт и вставка
+    идут одной транзакцией — иначе двумя одновременными нажатиями можно было
+    бы получить на одну подписку больше разрешённого.
     """
-    with FILE_LOCK:
-        subscriptions = read_subscriptions()
+    subscription = {
+        "user_id": user_id,
+        "date": day,
+        "minutes": minutes,
+        "service": service,
+        "length": length,
+        "density": density,
+        "price_from": price_from,
+        "price_to": price_to,
+    }
 
-        mine = [s for s in subscriptions if s["user_id"] == user_id]
-        if any(s["date"] == day for s in mine):
+    columns = list(subscription)
+
+    with db.transaction():
+        if subscriptions_count(user_id) >= config.MAX_SUBSCRIPTIONS:
             return None
-        if len(mine) >= config.MAX_SUBSCRIPTIONS:
-            return None
 
-        subscription = {
-            "user_id": user_id,
-            "date": day,
-            "minutes": minutes,
-            "service": service,
-            "length": length,
-            "density": density,
-            "price_from": price_from,
-            "price_to": price_to,
-        }
+        added = db.execute(
+            f"INSERT OR IGNORE INTO subscriptions ({', '.join(columns)}) "
+            f"VALUES ({placeholders(columns)})",
+            [subscription[column] for column in columns],
+        )
 
-        subscriptions.append(subscription)
-        save_subscriptions(subscriptions)
-        return subscription
+    return subscription if added else None
 
 
 def remove_subscription(user_id, day):
@@ -589,17 +530,14 @@ def remove_subscription(user_id, day):
 
     Вызывается и при отписке вручную, и когда клиент записался на этот
     день: ждать окошко, когда уже записан, незачем.
+
+    Здесь, в отличие от записей, строка именно удаляется: история «кто чего
+    ждал» никому не нужна, а сам факт подписки ничего не бронировал.
     """
-    with FILE_LOCK:
-        subscriptions = read_subscriptions()
-        left = [s for s in subscriptions
-                if not (s["user_id"] == user_id and s["date"] == day)]
-
-        if len(left) == len(subscriptions):
-            return False
-
-        save_subscriptions(left)
-        return True
+    return db.execute(
+        "DELETE FROM subscriptions WHERE user_id = ? AND date = ?",
+        (user_id, day),
+    ) > 0
 
 
 # =========================================================================
