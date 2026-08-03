@@ -66,6 +66,58 @@ def send(user_id, text, keyboard=None):
     api.messages.send(**params)
 
 
+def notify_owner(text):
+    """Сообщить владельцу сообщества — о новой записи, отмене, автоотмене.
+
+    Клавиатуру не шлём намеренно: она заменила бы владельцу ту, что у него
+    сейчас на экране, а он в этот момент может быть посреди своего разговора
+    с ботом.
+
+    Ошибку ловим и живём дальше. Владелец мог не написать сообществу первым
+    (тогда ВК не даст боту написать ему) или закрыть сообщения — но клиент,
+    который прямо сейчас записывается, не должен из-за этого получить
+    «что-то пошло не так». Уведомление здесь — приятное дополнение к записи,
+    а не её часть.
+    """
+    if not config.OWNER_ID:
+        return  # уведомления выключены в настройках
+
+    try:
+        send(config.OWNER_ID, text)
+    except ApiError as error:
+        print(f"не смогла написать владельцу: {error}")
+
+
+def client_name(user_id):
+    """Имя клиента: «Мария Петрова» — или пустая строка, если не узнали.
+
+    Ссылка вида vk.com/id123456 мастеру не говорит ничего: чтобы понять, кто
+    записался, ему пришлось бы открывать её в браузере. Имя он видит сразу
+    в сообщении.
+
+    Спрашиваем ВК при каждой отправке. Записей единицы в день, а своя таблица
+    клиентов с именами — это уже отдельное хозяйство, которое надо заполнять
+    и чистить.
+
+    Ловим любую ошибку, а не только ApiError: удалённая страница, оборванная
+    сеть или заглушка vk_api в тестах не должны мешать мастеру узнать о записи.
+    В худшем случае останется одна ссылка.
+    """
+    try:
+        person = api.users.get(user_ids=user_id)[0]
+        return f"{person['first_name']} {person['last_name']}".strip()
+    except Exception as error:
+        print(f"не смогла узнать имя {user_id}: {error}")
+        return ""
+
+
+def client_card(user_id):
+    """Кто клиент — строкой для сообщения мастеру: имя и ссылка на страницу."""
+    link = f"vk.com/id{user_id}"
+    name = client_name(user_id)
+    return f"Клиент: {name}\n{link}" if name else f"Клиент: {link}"
+
+
 # =========================================================================
 # 2. Состояния диалога
 # =========================================================================
@@ -86,6 +138,51 @@ CANCEL_CONFIRM = "CANCEL_CONFIRM"
 MY_SUBS = "MY_SUBS"                        # список подписок и отписка
 SELECTING_SUB_DATE = "SELECTING_SUB_DATE"  # выбор дня для подписки
 SUB_CONFIRM = "SUB_CONFIRM"                # «подписать вас на 31.07?»
+
+# --- шаги владельца -------------------------------------------------------
+# Их много, но устроены они одинаково: почти ничего не помнят между
+# сообщениями. Где выбор виден на самой кнопке (день, час, номер записи),
+# состояние вообще не нужно; где нужен — лежит в памяти и в базу не едет,
+# см. комментарий к OWNER_DRAFT ниже.
+OWNER_CABINET = "OWNER_CABINET"              # меню кабинета
+OWNER_SCHEDULE = "OWNER_SCHEDULE"            # дни и записи внутри дня
+OWNER_CANCEL_REASON = "OWNER_CANCEL_REASON"  # почему отменяем запись
+OWNER_CLOSE_KIND = "OWNER_CLOSE_KIND"        # что закрываем: день, часы, срок
+OWNER_CLOSE_SINCE = "OWNER_CLOSE_SINCE"      # с какого дня
+OWNER_CLOSE_UNTIL = "OWNER_CLOSE_UNTIL"      # по какой день
+OWNER_CLOSE_FROM = "OWNER_CLOSE_FROM"        # с какого часа
+OWNER_CLOSE_TO = "OWNER_CLOSE_TO"            # по какой час
+OWNER_CLOSE_REASON = "OWNER_CLOSE_REASON"    # что сказать клиентам
+OWNER_CLOSE_CONFIRM = "OWNER_CLOSE_CONFIRM"  # «отменить N записей и закрыть?»
+OWNER_CLOSURES = "OWNER_CLOSURES"            # что закрыто, снятие
+OWNER_WORK = "OWNER_WORK"                    # график: дни и часы
+OWNER_WORKDAYS = "OWNER_WORKDAYS"            # переключение дней недели
+OWNER_WORK_START = "OWNER_WORK_START"        # начало рабочего дня
+OWNER_WORK_END = "OWNER_WORK_END"            # конец рабочего дня
+
+# Ключи, в которых собирается будущее закрытие, пока мастер отвечает на
+# вопросы: день, часы, причина. Живут ТОЛЬКО в памяти — в DIALOG_FIELDS их
+# нет, и в базу они не попадают.
+#
+# Так сделано намеренно. Хранить их в базе значило бы пять новых колонок
+# в dialogs ради черновика, который живёт полминуты. Плата — перезапуск бота
+# посреди заполнения его теряет; поэтому каждый экран кабинета проверяет, что
+# нужное на месте, и если нет, возвращает мастера в кабинет вместо того,
+# чтобы падать.
+OWNER_DRAFT = ("schedule_day", "close_kind", "close_since", "close_until",
+               "close_from", "close_to", "close_reason", "close_affected",
+               "cancel_booking_id")
+
+# Все шаги кабинета одним списком: по нему handle_message() решает, отдавать
+# ли сообщение handle_owner(). Перечисление, а не префикс «OWNER_» в имени
+# состояния, — чтобы случайно совпавшая строка из базы не открыла кабинет.
+OWNER_STATES = (
+    OWNER_CABINET, OWNER_SCHEDULE, OWNER_CANCEL_REASON,
+    OWNER_CLOSE_KIND, OWNER_CLOSE_SINCE, OWNER_CLOSE_UNTIL,
+    OWNER_CLOSE_FROM, OWNER_CLOSE_TO, OWNER_CLOSE_REASON,
+    OWNER_CLOSE_CONFIRM, OWNER_CLOSURES,
+    OWNER_WORK, OWNER_WORKDAYS, OWNER_WORK_START, OWNER_WORK_END,
+)
 
 # Здесь хранится состояние всех пользователей:
 #   {123456: {"state": "SELECTING_LENGTH", "service": "keratin"}, ...}
@@ -224,6 +321,25 @@ def titles_keyboard(catalog, per_row=1):
     return build_keyboard(rows)
 
 
+def hints_text(catalog):
+    """Расшифровка вариантов под вопросом: «Короткие — до плеч».
+
+    Живёт рядом с titles_keyboard(), потому что делает то же самое: собирает
+    из справочника в config.py то, что увидит клиент. Добавили вариант
+    в настройки — появились и кнопка, и строка с пояснением.
+
+    Нужна там, где название кнопки само по себе ничего не говорит: длину
+    и особенно густоту своих волос человек про себя не знает, а ответ
+    определяет и цену, и сколько времени занять в расписании.
+
+    Вариант без подсказки просто пропускаем, а не падаем: кнопка у него всё
+    равно есть, и добавленная в настройки длина без hint должна стоить
+    строчки пояснения, а не всего сообщения.
+    """
+    return "\n".join(f"{item['title']} — {item['hint']}"
+                     for item in catalog.values() if item.get("hint"))
+
+
 # Подпись кнопки записей меняется у каждого клиента: «Мои записи (3/5)».
 # Поэтому это не готовая клавиатура, а функция: собираем её заново
 # при каждой отправке, иначе все увидят чужой счётчик.
@@ -231,6 +347,51 @@ MY_BOOKINGS_BUTTON = "Мои записи"
 
 
 MY_SUBS_BUTTON = "Мои подписки"
+
+# Вход в кабинет. Кнопку видит только владелец и только в главном меню —
+# см. menu_keyboard() и разбор MAIN_MENU в handle_message().
+#
+# Кабинет появился не ради красоты: в главном меню владельца уже четыре ряда
+# из пяти возможных, и четыре его кнопки туда не влезут — пропадёт выход
+# «В меню». Поэтому одна дверь, а за ней всё остальное.
+CABINET_BUTTON = "Кабинет"
+
+SCHEDULE_BUTTON = "Расписание"
+CLOSE_BUTTON = "Закрыть время"
+CLOSURES_BUTTON = "Что закрыто"
+WORK_BUTTON = "График работы"
+
+# Возврат в кабинет. Не «Назад»: так подписана листалка страниц на экране
+# времени, и в одной переписке две разные «Назад» путали бы.
+TO_CABINET = "В кабинет"
+
+# Возврат к списку дней с экрана одного дня.
+OTHER_SCHEDULE_DAY = "Другой день"
+
+# Что именно закрываем.
+CLOSE_WHOLE_DAY = "Весь день"
+CLOSE_HOURS = "Часть дня"
+CLOSE_PERIOD = "Несколько дней"
+CLOSE_PAUSE = "Пауза до отмены"
+
+# Подтверждение закрытия и снятие.
+CLOSE_YES = "Да, закрыть"
+CLOSE_NO = "Нет, оставить"
+
+# График работы.
+WORKDAYS_BUTTON = "Рабочие дни"
+WORK_START_BUTTON = "Начало дня"
+WORK_END_BUTTON = "Конец дня"
+WORK_DONE = "Готово"
+
+# На сколько дней вперёд «пауза до отмены» закрывает запись. Год — это просто
+# «надолго»: снимается она кнопкой, а не по сроку, но какой-то конец у строки
+# в базе быть обязан, иначе её пришлось бы отличать от остальных отдельным
+# признаком.
+PAUSE_DAYS = 365
+
+# Сколько дней показывать мастеру кнопками, когда он выбирает, что закрыть.
+CLOSE_DAYS_TO_SHOW = 9
 
 
 def my_bookings_button(user_id):
@@ -269,6 +430,13 @@ def menu_keyboard(user_id):
         sections.append(my_subs_button(user_id))
     if sections:
         rows.append(sections)
+
+    # Владельцу — вход в кабинет. Кнопка есть только здесь, в главном меню,
+    # и только у него: на других экранах она не появляется даже у владельца.
+    # Так дела мастера не могут встретиться с его же записью как клиента —
+    # из шага записи в кабинет просто нет двери.
+    if user_id == config.OWNER_ID:
+        rows.append([CABINET_BUTTON])
 
     return build_keyboard(rows)
 
@@ -310,7 +478,12 @@ CONFIRM_KEYBOARD = build_keyboard([
 CANCEL_YES = "Да, отменить запись"
 CANCEL_NO = "Нет, оставить"
 
+# Подпись не «Перенести»: рядом стоит «Выбрать другое время» с экрана времени,
+# и две похожие кнопки в одной переписке путали бы.
+MOVE_BOOKING = "Перенести на другое время"
+
 CANCEL_KEYBOARD = build_keyboard([
+    [MOVE_BOOKING],
     [CANCEL_YES],
     [CANCEL_NO],
     [BACK_TO_MENU],  # выход должен быть на любом экране
@@ -350,6 +523,14 @@ CANCEL_BOOKING = "Отменить запись"
 # клиенту клавиатуру тупиком нельзя.
 REMINDER_KEYBOARD = build_keyboard([
     [CONFIRM_COMING],
+    [CANCEL_BOOKING],
+    [BACK_TO_MENU],
+])
+
+# Напоминание в самый день процедуры. «Подтверждаю» здесь нет: подтверждение
+# получено ещё вчера, и кнопка, которая отвечает «подтверждать нечего», только
+# сбивает с толку. А отмена нужна: именно в этот день и срываются планы.
+DAY_REMINDER_KEYBOARD = build_keyboard([
     [CANCEL_BOOKING],
     [BACK_TO_MENU],
 ])
@@ -429,14 +610,73 @@ def find_key(catalog, text):
 # 6. Шаги сценария
 # =========================================================================
 
+def contacts():
+    """Адрес и телефон одним куском.
+
+    Одна функция на четыре сообщения — приветствие, подтверждение записи,
+    «готово, записала» и «подписала». Это те моменты, когда клиент как раз
+    и спрашивает «а где вы находитесь?»: ответ должен быть в сообщении,
+    а не в отдельной переписке с мастером.
+    """
+    return f"Адрес: {config.ADDRESS}\nТелефон: {config.PHONE}"
+
+
+def booking_card(booking):
+    """Запись так, как её видит мастер: что, когда, какие волосы, почём.
+
+    Длина и густота мастеру нужнее, чем клиенту: по ним он заранее понимает,
+    сколько уйдёт материала и не придётся ли задержаться. Клиенту эти строки
+    в его сообщениях не показываем — он сам их только что и выбирал.
+    """
+    return (
+        f"{config.SERVICES[booking['service']]['title']}\n"
+        f"{schedule.day_label(booking['date'])}, {booking['start']}–"
+        f"{schedule.end_time(booking)}\n"
+        f"Длина: {config.LENGTHS[booking['length']]['title']}, "
+        f"густота: {config.DENSITIES[booking['density']]['title']}\n"
+        f"Стоимость: {booking['price_from']}–{booking['price_to']} ₽"
+    )
+
+
+def late_note(booking):
+    """Приписка про позднюю отмену — или пустая строка, если отменили заранее.
+
+    Отмена за неделю и отмена за час — для мастера разные новости: во втором
+    случае время уже не продать, и узнать об этом он должен сразу, а не вечером
+    из расписания.
+
+    Отрицательный остаток означает, что запись успела начаться: приписывать
+    к ней «оставалось столько-то» бессмысленно.
+    """
+    left = schedule.minutes_left(booking)
+
+    if left <= 0 or left > config.LATE_CANCEL_HOURS * 60:
+        return ""
+
+    return f"\n\nДо записи оставалось {format_duration(left)}."
+
+
+def forget_move(user_id):
+    """Забыть, что клиент собирался что-то переносить.
+
+    Вызывается на выходе в меню и в начале нового расчёта — то есть везде,
+    откуда начинается что-то другое. Без этого брошенный посреди дела перенос
+    остался бы висеть в состоянии, и следующая обычная запись сняла бы старую:
+    признаком переноса служит как раз move_id.
+    """
+    get_user(user_id).pop("move_id", None)
+
+
 def show_menu(user_id, greeting=False):
     user = get_user(user_id)
+    forget_move(user_id)
     user["state"] = MAIN_MENU
 
     if greeting:
         text = (
             "Привет! Я помогу подобрать процедуру, рассчитать примерную "
             "стоимость и записаться к мастеру.\n\n"
+            f"{contacts()}\n\n"
             "Выбери, что нужно:"
         )
     else:
@@ -447,6 +687,7 @@ def show_menu(user_id, greeting=False):
 
 def ask_service(user_id):
     user = get_user(user_id)
+    forget_move(user_id)  # начали заново — значит это уже не перенос
     user["state"] = SELECTING_SERVICE
     send(user_id, "Выберите процедуру:", SERVICE_KEYBOARD)
 
@@ -454,13 +695,17 @@ def ask_service(user_id):
 def ask_length(user_id):
     user = get_user(user_id)
     user["state"] = SELECTING_LENGTH
-    send(user_id, "Выберите длину волос:", LENGTH_KEYBOARD)
+    send(user_id,
+         "Выберите длину волос:\n\n" + hints_text(config.LENGTHS),
+         LENGTH_KEYBOARD)
 
 
 def ask_density(user_id):
     user = get_user(user_id)
     user["state"] = SELECTING_DENSITY
-    send(user_id, "Выберите густоту волос:", DENSITY_KEYBOARD)
+    send(user_id,
+         "Выберите густоту волос:\n\n" + hints_text(config.DENSITIES),
+         DENSITY_KEYBOARD)
 
 
 def show_price(user_id):
@@ -549,11 +794,15 @@ def ask_date(user_id):
 
     # Лимит проверяем и здесь: сюда можно прийти не только из start_booking(),
     # но и из калькулятора — «Узнать стоимость» лимитом не ограничен.
-    if schedule.limit_reached(user_id):
+    #
+    # При переносе не проверяем: записей у клиента не прибавится, старая уйдёт
+    # вместе с новой. Иначе клиент, набравший максимум, не смог бы передвинуть
+    # ни одну из своих записей — а это ровно то, что ему в такой момент нужно.
+    if not user.get("move_id") and schedule.limit_reached(user_id):
         show_limit_message(user_id)
         return
 
-    days = schedule.work_days(user["minutes"])
+    days = schedule.work_days(user["minutes"], user.get("move_id"))
 
     if not days:
         send(
@@ -590,7 +839,8 @@ def ask_time(user_id, day, page=0):
     за страницу.
     """
     user = get_user(user_id)
-    slots = schedule.free_slots(day, user["minutes"])
+    slots = schedule.free_slots(day, user["minutes"],
+                                exclude_id=user.get("move_id"))
 
     if not slots:
         # Пока клиент выбирал, день успели занять — возвращаем к списку дней.
@@ -642,29 +892,59 @@ def show_confirmation(user_id, start):
     user["time"] = start
     user["state"] = CONFIRMING
 
+    # При переносе показываем, откуда переносим: иначе на этом экране два
+    # времени — старое и новое — и клиент не видит, какое из них какое.
+    previous = ""
+    if user.get("move_id"):
+        old = schedule.get_booking(user["move_id"])
+        if old is not None:
+            previous = (f"Вместо {schedule.pretty_date(old['date'])} "
+                        f"в {old['start']}\n\n")
+
     text = (
         "Проверьте запись:\n\n"
+        f"{previous}"
         f"Процедура: {config.SERVICES[user['service']]['title']}\n"
         f"Дата: {schedule.pretty_date(user['day'])}\n"
         f"Время начала: {start}\n"
         f"Продолжительность: {format_duration(user['minutes'])}\n"
-        f"Ориентировочная стоимость: {user['price_from']}–{user['price_to']} ₽"
+        f"Ориентировочная стоимость: {user['price_from']}–{user['price_to']} ₽\n\n"
+        f"{contacts()}"
     )
     send(user_id, text, CONFIRM_KEYBOARD)
 
 
 def save_booking(user_id):
-    """Сохранить запись — если время свободно и лимит не исчерпан."""
+    """Сохранить запись или перенести старую — если время ещё свободно.
+
+    Оба случая заканчиваются одинаково (запись есть, подписка на этот день
+    больше не нужна, владельцу ушло сообщение), поэтому и живут в одной
+    функции: развилок в ней две, а не два сценария целиком.
+    """
     user = get_user(user_id)
+    moving = user.get("move_id")
 
     # Ещё одна проверка лимита, прямо перед сохранением. Та, в ask_date(),
     # была для удобства клиента, а эта — настоящая: она спрашивает базу
     # заново, поэтому видит записи, сделанные пока клиент выбирал время.
-    if schedule.limit_reached(user_id):
+    # При переносе её нет по той же причине, что и в ask_date().
+    if not moving and schedule.limit_reached(user_id):
         show_limit_message(user_id)
         return
 
-    booking = schedule.create_booking(
+    previous = schedule.get_booking(moving) if moving else None
+
+    if moving and (previous is None
+                   or previous["status"] not in schedule.ACTIVE_STATUSES):
+        # Пока клиент выбирал новое время, старую запись отменили или она
+        # успела пройти. Переносить нечего, а записать «заодно» новую было бы
+        # уже не тем, о чём он просил.
+        forget_move(user_id)
+        send(user_id, "Запись, которую вы переносили, уже не активна.")
+        show_my_bookings(user_id)
+        return
+
+    parameters = dict(
         user_id=user_id,
         day=user["day"],
         start=user["time"],
@@ -676,9 +956,16 @@ def save_booking(user_id):
         price_to=user["price_to"],
     )
 
+    if moving:
+        booking = schedule.move_booking(moving, **parameters)
+    else:
+        booking = schedule.create_booking(**parameters)
+
     if booking is None:
         # Между показом кнопки и нажатием окошко заняли — обычное дело,
         # когда клиентов много. Само уведомление время не бронирует.
+        # Перенос при этом не срывается: старая запись цела, и move_id
+        # остаётся — клиент просто выбирает другое время.
         send(user_id, "К сожалению, это окошко уже заняли 😔")
         ask_time(user_id, user["day"])
         return
@@ -686,16 +973,46 @@ def save_booking(user_id):
     # Клиент дождался своего дня и записался — ждать в нём больше нечего.
     schedule.remove_subscription(user_id, booking["date"])
 
+    forget_move(user_id)
     user["state"] = MAIN_MENU
+
+    if previous is not None:
+        headline = (f"Перенесла запись с "
+                    f"{schedule.pretty_date(previous['date'])} "
+                    f"{previous['start']} на "
+                    f"{schedule.pretty_date(booking['date'])} "
+                    f"в {booking['start']}.")
+    else:
+        headline = (f"Готово! Записала вас на "
+                    f"{schedule.pretty_date(booking['date'])} "
+                    f"в {booking['start']}.")
+
     send(
         user_id,
-        f"Готово! Записала вас на {schedule.pretty_date(booking['date'])} "
-        f"в {booking['start']}.\n\n"
+        f"{headline}\n\n"
         f"Процедура: {config.SERVICES[booking['service']]['title']}\n"
         f"Продолжительность: {format_duration(booking['minutes'])}\n"
-        f"Стоимость: {booking['price_from']}–{booking['price_to']} ₽",
+        f"Стоимость: {booking['price_from']}–{booking['price_to']} ₽\n\n"
+        f"{contacts()}",
         menu_keyboard(user_id),  # счётчик записей уже увеличился
     )
+
+    # Владельцу — последним. Клиент ждёт ответа прямо сейчас, а уведомление
+    # мастеру стоит ещё двух обращений к VK: узнать имя и отправить.
+    if previous is not None:
+        notify_owner("Клиент перенёс запись\n\n"
+                     f"Было: {schedule.day_label(previous['date'])}, "
+                     f"{previous['start']}\n\n"
+                     f"{booking_card(booking)}\n\n"
+                     f"{client_card(user_id)}")
+    else:
+        notify_owner("Новая запись\n\n"
+                     f"{booking_card(booking)}\n\n"
+                     f"{client_card(user_id)}")
+
+    # Старое время освободилось — ровно как при отмене, и ждать его кто-то мог.
+    if previous is not None:
+        notify_subscribers(previous)
 
 
 # =========================================================================
@@ -710,7 +1027,7 @@ def save_booking(user_id):
 def ask_sub_date(user_id):
     """Показать дни, в которых времени нет, — на них можно подписаться."""
     user = get_user(user_id)
-    days = schedule.busy_days(user["minutes"])
+    days = schedule.busy_days(user["minutes"], user.get("move_id"))
 
     if not days:
         # Занятых дней нет вообще: клиент нажал «нужного дня нет», хотя
@@ -823,7 +1140,8 @@ def do_subscribe(user_id):
         f"Подписала вас на {schedule.pretty_date(day)}.\n\n"
         "Если кто-то отменит запись и освободится окошко под вашу процедуру, "
         "я сразу напишу — записаться можно будет прямо из сообщения.\n"
-        "Место при этом не бронируется: кто первый записался, того и время.",
+        "Место при этом не бронируется: кто первый записался, того и время.\n\n"
+        f"{contacts()}",
         menu_keyboard(user_id),
     )
 
@@ -1013,18 +1331,51 @@ def show_my_bookings(user_id):
 
 
 def ask_cancel_confirm(user_id, booking):
-    """Спросить подтверждение отмены — чтобы не отменить случайным нажатием."""
+    """Спросить, что делать с записью: перенести, отменить или оставить.
+
+    Экран остался с подтверждением отмены — отменить случайным нажатием
+    по-прежнему нельзя. Перенос добавлен сюда же, а не отдельным пунктом
+    в «Мои записи»: выбирать запись дважды, сперва для отмены, потом для
+    переноса, клиенту незачем — он уже выбрал, о какой идёт речь.
+    """
     user = get_user(user_id)
-    user["cancel_id"] = booking["id"]  # запоминаем, ЧТО именно отменяем
+    user["cancel_id"] = booking["id"]  # запоминаем, о КАКОЙ записи речь
     user["state"] = CANCEL_CONFIRM
 
     send(
         user_id,
-        "Отменить запись?\n\n"
+        "Что сделать с записью?\n\n"
         f"{config.SERVICES[booking['service']]['title']}\n"
         f"{schedule.pretty_date(booking['date'])}, {booking['start']}",
         CANCEL_KEYBOARD,
     )
+
+
+def start_move(user_id):
+    """Нажали «Перенести» — начинаем выбор нового дня и времени.
+
+    Параметры процедуры берём из самой записи, а не из памяти: клиент мог
+    успеть посчитать стоимость чего-то другого, а переносит он именно эту
+    процедуру и по той цене, по которой записывался.
+
+    move_id — признак того, что идёт перенос, а не новая запись. По нему
+    save_booking() понимает, что старую запись надо снять, а лимит проверять
+    не нужно: записей у клиента не прибавится.
+    """
+    user = get_user(user_id)
+    booking = schedule.get_booking(user["cancel_id"])
+
+    if booking is None or booking["status"] not in schedule.ACTIVE_STATUSES:
+        send(user_id, "Эта запись уже не активна — переносить нечего.")
+        show_my_bookings(user_id)
+        return
+
+    for field in ("service", "length", "density", "minutes",
+                  "price_from", "price_to"):
+        user[field] = booking[field]
+
+    user["move_id"] = booking["id"]
+    ask_date(user_id)
 
 
 def do_cancel(user_id):
@@ -1046,6 +1397,10 @@ def do_cancel(user_id):
 
     # Рассылка последней: клиент, который отменяет, ждёт ответа прямо сейчас,
     # а уведомления — это ещё несколько запросов к VK.
+    notify_owner("Клиент отменил запись\n\n"
+                 f"{booking_card(booking)}\n\n"
+                 f"{client_card(user_id)}"
+                 f"{late_note(booking)}")
     notify_subscribers(booking)
 
 
@@ -1105,6 +1460,808 @@ def start_cancel(user_id):
 
     send(user_id, "Выберите, какую запись отменить:")
     show_my_bookings(user_id)
+
+
+# =========================================================================
+# 9а. Кабинет владельца
+# =========================================================================
+# Всё, что бот показывает не клиенту, а мастеру: расписание, закрытие времени,
+# отмена записи с причиной и рабочий график. Ролей ради этого не заводим:
+# мастер здесь один и это владелец сообщества, поэтому всё различие —
+# сравнение с config.OWNER_ID в is_owner().
+#
+# Вход только из главного меню (см. menu_keyboard): из шага записи в кабинет
+# двери нет, поэтому дела мастера не могут перебить владельцу его собственную
+# запись — состояние диалога у него одно на оба занятия.
+#
+# Экраны стараются ничего не помнить: где выбор виден на самой кнопке (день,
+# час, номер записи), состояние не нужно вовсе. Где помнить приходится —
+# черновик закрытия — он живёт в памяти и в базу не едет, а каждый экран
+# проверяет, на месте ли нужное, и молча возвращает мастера в кабинет, если
+# бота перезапустили на середине.
+
+# Что видит мастер вместо внутреннего названия статуса. От клиентских подписей
+# отличаются намеренно: клиенту важно, что от него хотят, мастеру — можно ли
+# на эту запись рассчитывать.
+OWNER_STATUS_LABELS = {
+    "NEW": "напоминание ещё не отправляла",
+    "REMINDED": "⚠️ не подтверждена",
+    "CONFIRMED": "✅ подтверждена",
+}
+
+# Сколько символов причины оставляем. Ограничение не от жадности: причина
+# уходит клиенту в сообщении и хранится в записи, а мастер вполне может
+# случайно отправить туда пересланный текст на три экрана.
+MAX_REASON = 300
+
+
+def is_owner(user_id):
+    """Это владелец сообщества?
+
+    Проверка живёт в функции, а не в сравнениях по месту: их несколько —
+    кнопка в меню и разбор каждого шага кабинета, — и разъехаться они
+    не должны. Нулевой OWNER_ID владельцем не делает никого.
+    """
+    return bool(config.OWNER_ID) and user_id == config.OWNER_ID
+
+
+def forget_draft(user_id):
+    """Забыть недособранное закрытие и выбранный день расписания."""
+    user = get_user(user_id)
+    for field in OWNER_DRAFT:
+        user.pop(field, None)
+
+
+def clean_reason(text):
+    """Причина от мастера: без лишних пробелов и не длиннее разумного."""
+    return " ".join(text.split())[:MAX_REASON]
+
+
+def closed_note():
+    """Строка про паузу для кабинета: закрыто ли что-нибудь прямо сейчас."""
+    today = date.today().isoformat()
+    closures = schedule.all_closures()
+
+    if schedule.closed_all_day(today, closures):
+        return f"Сегодня запись закрыта: {schedule.closure_reason(today, closures)}"
+    if closures:
+        return f"Закрытых промежутков впереди: {len(closures)}"
+    return "Ничего не закрыто, запись открыта."
+
+
+def show_cabinet(user_id):
+    """Кабинет мастера — всё, что он может сделать."""
+    user = get_user(user_id)
+    forget_draft(user_id)
+    user["state"] = OWNER_CABINET
+
+    send(
+        user_id,
+        "Кабинет мастера.\n\n"
+        f"{closed_note()}\n"
+        f"Работаете: {work_schedule_text()}",
+        build_keyboard([
+            [SCHEDULE_BUTTON],
+            [CLOSE_BUTTON],
+            [CLOSURES_BUTTON],
+            [WORK_BUTTON],
+            [BACK_TO_MENU],
+        ]),
+    )
+
+
+# --- расписание -----------------------------------------------------------
+
+def show_schedule_days(user_id):
+    """Расписание: ближайшие дни, в которых кто-то записан."""
+    user = get_user(user_id)
+    days = schedule.days_with_bookings()[:config.DAYS_TO_SHOW]
+
+    if not days:
+        send(user_id, "Записей на ближайшие дни нет — время свободно.")
+        show_cabinet(user_id)
+        return
+
+    user["state"] = OWNER_SCHEDULE
+    user.pop("schedule_day", None)  # вернулись к списку — день больше не выбран
+
+    lines = ["Ближайшие дни с записями:\n"]
+    for day, count in days:
+        lines.append(f"{schedule.day_label(day)} — {count} "
+                     f"{plural(count, 'запись', 'записи', 'записей')}")
+    lines.append("\nДней, которых нет в списке, никто не занял.")
+
+    rows = chunk([schedule.day_label(day) for day, _ in days],
+                 COMFORT_BUTTONS_IN_ROW)
+    rows.append([TO_CABINET, BACK_TO_MENU])
+
+    send(user_id, "\n".join(lines), build_keyboard(rows))
+
+
+def show_schedule_day(user_id, day):
+    """Расписание одного дня: кто, когда и на что записан.
+
+    Записи пронумерованы, и номер — это кнопка отмены. Так же, как у клиента
+    в «Моих записях»: номер короткий, пять штук влезают в один ряд, а искать
+    для отмены отдельный экран мастеру не приходится.
+    """
+    user = get_user(user_id)
+    bookings = schedule.day_bookings(day)
+
+    if not bookings:
+        # День успели освободить, пока мастер смотрел на список.
+        send(user_id, f"{schedule.day_label(day)} — записей уже нет.")
+        show_schedule_days(user_id)
+        return
+
+    user["state"] = OWNER_SCHEDULE
+    user["schedule_day"] = day
+
+    lines = [f"{schedule.pretty_date(day)}, {len(bookings)} "
+             f"{plural(len(bookings), 'запись', 'записи', 'записей')}:"]
+
+    for number, booking in enumerate(bookings, start=1):
+        lines.append(
+            f"\n{number}. {booking['start']}–{schedule.end_time(booking)}  "
+            f"{config.SERVICES[booking['service']]['title']}\n"
+            f"{client_card(booking['user_id'])}\n"
+            f"{config.LENGTHS[booking['length']]['title'].lower()}, "
+            f"{config.DENSITIES[booking['density']]['title'].lower()}, "
+            f"{booking['price_from']}–{booking['price_to']} ₽\n"
+            f"{OWNER_STATUS_LABELS.get(booking['status'], booking['status'])}"
+        )
+
+    lines.append("\nЧтобы отменить запись, нажмите её номер.")
+
+    numbers = [str(number) for number in range(1, len(bookings) + 1)]
+    rows = chunk(numbers, MAX_BUTTONS_IN_ROW)
+    rows.append([OTHER_SCHEDULE_DAY])
+    rows.append([TO_CABINET, BACK_TO_MENU])
+
+    send(user_id, "\n".join(lines), build_keyboard(rows))
+
+
+# --- отмена записи мастером ----------------------------------------------
+
+def ask_cancel_reason(user_id, booking):
+    """Спросить, почему мастер отменяет запись.
+
+    Причину спрашиваем до отмены, а не после: клиент, у которого сняли запись
+    без объяснения, придёт выяснять к мастеру — то есть ровно та переписка,
+    которой бот и должен был избавить.
+    """
+    user = get_user(user_id)
+    user["cancel_booking_id"] = booking["id"]
+    user["state"] = OWNER_CANCEL_REASON
+
+    send(
+        user_id,
+        "Отменяем запись:\n\n"
+        f"{booking_card(booking)}\n"
+        f"{client_card(booking['user_id'])}\n\n"
+        "Напишите причину — я передам её клиенту.",
+        build_keyboard([[TO_CABINET, BACK_TO_MENU]]),
+    )
+
+
+def do_master_cancel(user_id, reason):
+    """Отменить запись от лица мастера и написать клиенту."""
+    user = get_user(user_id)
+    booking_id = user.get("cancel_booking_id")
+
+    if booking_id is None:
+        # Бота перезапустили посреди ввода причины.
+        show_cabinet(user_id)
+        return
+
+    booking = schedule.cancel_by_master(booking_id, reason)
+    user.pop("cancel_booking_id", None)
+
+    if booking is None:
+        send(user_id, "Эту запись уже отменили — ничего не делаю.")
+        show_schedule_days(user_id)
+        return
+
+    try:
+        send(
+            booking["user_id"],
+            "Мастер отменил вашу запись 😔\n\n"
+            f"{config.SERVICES[booking['service']]['title']}\n"
+            f"{schedule.pretty_date(booking['date'])}, {booking['start']}\n\n"
+            f"Причина: {reason}\n\n"
+            "Извините за неудобство. Записаться на другое время можно кнопкой "
+            "ниже — или напишите нам, подберём вместе.\n\n"
+            f"{contacts()}",
+            menu_keyboard(booking["user_id"]),
+        )
+    except ApiError as error:
+        print(f"не смогла написать {booking['user_id']}: {error}")
+        send(user_id, "Клиенту написать не получилось — сообщите ему сами.")
+
+    send(user_id, "Запись отменена, клиенту написала.")
+
+    # Время освободилось по-настоящему — как при обычной отмене.
+    notify_subscribers(booking)
+
+    day = user.get("schedule_day")
+    if day:
+        show_schedule_day(user_id, day)
+    else:
+        show_schedule_days(user_id)
+
+
+# --- закрытие времени -----------------------------------------------------
+
+def ask_close_kind(user_id):
+    """С чего начинается закрытие: что именно закрываем."""
+    user = get_user(user_id)
+    forget_draft(user_id)
+    user["state"] = OWNER_CLOSE_KIND
+
+    send(
+        user_id,
+        "Что закрыть?\n\n"
+        f"«{CLOSE_WHOLE_DAY}» — не работаете в этот день.\n"
+        f"«{CLOSE_HOURS}» — отлучитесь на несколько часов.\n"
+        f"«{CLOSE_PERIOD}» — отпуск или несколько дней подряд.\n"
+        f"«{CLOSE_PAUSE}» — запись закрыта, пока не откроете сами.",
+        build_keyboard([
+            [CLOSE_WHOLE_DAY],
+            [CLOSE_HOURS],
+            [CLOSE_PERIOD],
+            [CLOSE_PAUSE],
+            [TO_CABINET],
+        ]),
+    )
+
+
+def ask_close_since(user_id):
+    """Выбрать день (или первый день периода)."""
+    user = get_user(user_id)
+    user["state"] = OWNER_CLOSE_SINCE
+
+    days = schedule.upcoming_work_days(CLOSE_DAYS_TO_SHOW)
+    rows = chunk([schedule.day_label(day) for day in days],
+                 COMFORT_BUTTONS_IN_ROW)
+    rows.append([TO_CABINET])
+
+    question = ("С какого дня?" if user["close_kind"] == CLOSE_PERIOD
+                else "Какой день?")
+    send(user_id, question, build_keyboard(rows))
+
+
+def ask_close_until(user_id):
+    """Выбрать последний день периода — из тех, что после первого."""
+    user = get_user(user_id)
+    user["state"] = OWNER_CLOSE_UNTIL
+
+    days = [day for day in schedule.upcoming_work_days(CLOSE_DAYS_TO_SHOW * 2)
+            if day > user["close_since"]][:CLOSE_DAYS_TO_SHOW]
+
+    if not days:
+        send(user_id, "Дальше рабочих дней не нашлось — закрываю один день.")
+        user["close_until"] = user["close_since"]
+        ask_close_reason(user_id)
+        return
+
+    rows = chunk([schedule.day_label(day) for day in days],
+                 COMFORT_BUTTONS_IN_ROW)
+    rows.append([TO_CABINET])
+
+    send(user_id,
+         f"По какой день включительно?\n"
+         f"Первый закрытый — {schedule.pretty_date(user['close_since'])}.",
+         build_keyboard(rows))
+
+
+def ask_close_from(user_id):
+    """С какого часа мастера не будет."""
+    user = get_user(user_id)
+    user["state"] = OWNER_CLOSE_FROM
+
+    rows = chunk(schedule.work_hours(), COMFORT_BUTTONS_IN_ROW)
+    rows.append([TO_CABINET])
+
+    send(user_id,
+         f"{schedule.pretty_date(user['close_since'])} — с какого часа?",
+         build_keyboard(rows))
+
+
+def ask_close_to(user_id):
+    """По какой час. Показываем только то, что позже начала."""
+    user = get_user(user_id)
+    user["state"] = OWNER_CLOSE_TO
+
+    hours = schedule.work_hours(first=user["close_from"])
+    if not hours:
+        # Начало пришлось на самый конец дня — закрываем до конца.
+        user["close_to"] = schedule.work_end()
+        ask_close_reason(user_id)
+        return
+
+    rows = chunk(hours, COMFORT_BUTTONS_IN_ROW)
+    rows.append([TO_CABINET])
+
+    send(user_id, f"С {user['close_from']} — по какой час?",
+         build_keyboard(rows))
+
+
+def ask_close_reason(user_id):
+    """Что сказать клиентам, чьи записи придётся отменить."""
+    user = get_user(user_id)
+    user["state"] = OWNER_CLOSE_REASON
+
+    send(
+        user_id,
+        f"Закрываю: {closure_text(user)}.\n\n"
+        "Напишите причину — её увидят клиенты, чьи записи попадут "
+        "в это время.",
+        build_keyboard([[TO_CABINET, BACK_TO_MENU]]),
+    )
+
+
+def closure_text(draft):
+    """Человеческое описание того, что закрываем: для вопросов и подтверждений."""
+    since = schedule.pretty_date(draft["close_since"])
+
+    if draft["close_kind"] == CLOSE_PAUSE:
+        return "запись целиком, пока не откроете"
+    if draft["close_kind"] == CLOSE_PERIOD:
+        return f"с {since} по {schedule.pretty_date(draft['close_until'])}"
+    if draft["close_kind"] == CLOSE_HOURS:
+        return f"{since}, с {draft['close_from']} до {draft['close_to']}"
+    return since
+
+
+def ask_close_confirm(user_id):
+    """Показать, что будет закрыто и сколько записей это заденет."""
+    user = get_user(user_id)
+    user["state"] = OWNER_CLOSE_CONFIRM
+
+    affected = schedule.bookings_in_closure(
+        user["close_since"], user["close_until"],
+        user.get("close_from"), user.get("close_to"),
+    )
+    user["close_affected"] = len(affected)
+
+    lines = [f"Закрываю {closure_text(user)}.",
+             f"Причина: {user['close_reason']}"]
+
+    if affected:
+        lines.append(f"\nВ это время {len(affected)} "
+                     f"{plural(len(affected), 'запись', 'записи', 'записей')} — "
+                     "я их отменю и напишу каждому клиенту причину:")
+        for booking in affected:
+            lines.append(f"  {schedule.day_label(booking['date'])} "
+                         f"{booking['start']} — "
+                         f"{config.SERVICES[booking['service']]['title']}")
+    else:
+        lines.append("\nЗаписей в это время нет — никого не потревожу.")
+
+    send(user_id, "\n".join(lines),
+         build_keyboard([[CLOSE_YES], [CLOSE_NO], [TO_CABINET]]))
+
+
+def do_close(user_id):
+    """Закрыть время и отменить попавшие в него записи."""
+    user = get_user(user_id)
+
+    for field in ("close_kind", "close_since", "close_until", "close_reason"):
+        if user.get(field) is None:
+            show_cabinet(user_id)  # перезапуск посреди заполнения
+            return
+
+    reason = user["close_reason"]
+    affected = schedule.bookings_in_closure(
+        user["close_since"], user["close_until"],
+        user.get("close_from"), user.get("close_to"),
+    )
+
+    schedule.add_closure(user["close_since"], user["close_until"],
+                         user.get("close_from"), user.get("close_to"), reason)
+
+    cancelled = schedule.cancel_many_by_master(affected, reason)
+
+    # Подписчикам НЕ пишем: время не освободилось, оно закрыто. Уведомление
+    # «освободилось окошко» привело бы их к экрану, где записаться некуда.
+    failed = 0
+    for booking in cancelled:
+        try:
+            send(
+                booking["user_id"],
+                "Мастер отменил вашу запись 😔\n\n"
+                f"{config.SERVICES[booking['service']]['title']}\n"
+                f"{schedule.pretty_date(booking['date'])}, "
+                f"{booking['start']}\n\n"
+                f"Причина: {reason}\n\n"
+                "Извините за неудобство. Как только смогу — запишу вас "
+                "на другое время, выберите его кнопкой ниже.\n\n"
+                f"{contacts()}",
+                menu_keyboard(booking["user_id"]),
+            )
+        except ApiError as error:
+            failed += 1
+            print(f"не смогла написать {booking['user_id']}: {error}")
+
+    report = [f"Закрыла {closure_text(user)}."]
+    if cancelled:
+        report.append(f"Отменила записей: {len(cancelled)}, клиентам написала.")
+    if failed:
+        report.append(f"Не дошло до {failed} — этим напишите сами.")
+
+    send(user_id, "\n".join(report))
+    show_cabinet(user_id)
+
+
+def show_closures(user_id):
+    """Что закрыто и как это снять."""
+    user = get_user(user_id)
+    closures = schedule.all_closures()
+
+    if not closures:
+        send(user_id, "Ничего не закрыто — запись открыта на все рабочие дни.")
+        show_cabinet(user_id)
+        return
+
+    user["state"] = OWNER_CLOSURES
+
+    lines = ["Закрытое время:"]
+    for number, closure in enumerate(closures, start=1):
+        when = schedule.pretty_date(closure["since"])
+        if closure["until"] != closure["since"]:
+            when += f" — {schedule.pretty_date(closure['until'])}"
+        if closure["start"]:
+            when += f", с {closure['start']} до {closure['finish']}"
+        lines.append(f"\n{number}. {when}\n{closure['reason']}")
+
+    lines.append("\nЧтобы снова открыть запись, нажмите номер.")
+    lines.append("Отменённые записи при этом не вернутся — "
+                 "клиентам придётся записаться заново.")
+
+    numbers = [str(number) for number in range(1, len(closures) + 1)]
+    rows = chunk(numbers, MAX_BUTTONS_IN_ROW)
+    rows.append([TO_CABINET, BACK_TO_MENU])
+
+    send(user_id, "\n".join(lines), build_keyboard(rows))
+
+
+def do_open(user_id, closure):
+    """Снять закрытие."""
+    if schedule.remove_closure(closure["id"]):
+        send(user_id, f"Открыла {schedule.pretty_date(closure['since'])}.")
+    else:
+        send(user_id, "Это закрытие уже снято.")
+    show_closures(user_id)
+
+
+# --- рабочий график -------------------------------------------------------
+
+def work_schedule_text():
+    """График одной строкой: «Пн–Сб, 10:00–20:00» — но честно, с пропусками."""
+    days = schedule.work_weekdays()
+    if not days:
+        return "выходных нет только у роботов — рабочие дни не заданы"
+
+    names = ", ".join(schedule.WEEKDAYS[day] for day in sorted(days))
+    return f"{names}, {schedule.work_start()}–{schedule.work_end()}"
+
+
+def show_work(user_id):
+    """График работы: что менять."""
+    user = get_user(user_id)
+    user["state"] = OWNER_WORK
+
+    send(
+        user_id,
+        f"График работы: {work_schedule_text()}.\n\n"
+        "Он влияет только на новые записи. Уже записанных клиентов "
+        "изменение графика не трогает — если время перестало подходить, "
+        "запись нужно отменить или перенести.",
+        build_keyboard([
+            [WORKDAYS_BUTTON],
+            [WORK_START_BUTTON],
+            [WORK_END_BUTTON],
+            [TO_CABINET, BACK_TO_MENU],
+        ]),
+    )
+
+
+def show_workdays(user_id):
+    """Переключатель дней недели: нажал — включил, нажал ещё раз — выключил.
+
+    Ничего не запоминаем между сообщениями: текущий набор лежит в базе,
+    и каждое нажатие пишет туда сразу. Поэтому экран одинаково работает
+    и после перезапуска, и из старого сообщения.
+    """
+    user = get_user(user_id)
+    user["state"] = OWNER_WORKDAYS
+
+    days = schedule.work_weekdays()
+    labels = [f"{'✅' if number in days else '❌'} {name}"
+              for number, name in enumerate(schedule.WEEKDAYS)]
+
+    rows = chunk(labels, COMFORT_BUTTONS_IN_ROW)
+    rows.append([WORK_DONE])
+
+    send(user_id,
+         "Рабочие дни — нажмите, чтобы включить или выключить:\n\n"
+         f"Сейчас: {work_schedule_text()}",
+         build_keyboard(rows))
+
+
+def toggle_workday(user_id, number):
+    """Включить или выключить день недели."""
+    days = set(schedule.work_weekdays())
+
+    if number in days:
+        if len(days) == 1:
+            send(user_id, "Это последний рабочий день — "
+                          "совсем без рабочих дней записаться будет некуда.")
+            show_workdays(user_id)
+            return
+        days.remove(number)
+    else:
+        days.add(number)
+
+    schedule.set_work_schedule(days=days)
+    show_workdays(user_id)
+
+
+# Из каких часов мастер выбирает границы рабочего дня. Не все подряд:
+# при трёх кнопках в ряду сутки заняли бы восемь рядов, а VK покажет пять.
+# Утро и вечер разведены — начало дня в 22:00 никому не нужно, а вот конец
+# в 22:00 вполне бывает.
+WORK_START_HOURS = range(7, 16)   # 07:00–15:00
+WORK_END_HOURS = range(14, 24)    # 14:00–23:00
+
+
+def ask_work_hour(user_id, which):
+    """Выбрать начало или конец рабочего дня."""
+    user = get_user(user_id)
+    user["state"] = OWNER_WORK_START if which == "start" else OWNER_WORK_END
+
+    hours = WORK_START_HOURS if which == "start" else WORK_END_HOURS
+    rows = chunk([schedule.to_time(hour * 60) for hour in hours],
+                 COMFORT_BUTTONS_IN_ROW)
+    rows.append([TO_CABINET])
+
+    what = "начинается" if which == "start" else "заканчивается"
+    send(user_id, f"Во сколько {what} рабочий день?", build_keyboard(rows))
+
+
+def set_work_hour(user_id, which, moment):
+    """Сохранить границу рабочего дня, если она не переворачивает день."""
+    start = moment if which == "start" else schedule.work_start()
+    finish = moment if which == "end" else schedule.work_end()
+
+    if schedule.to_minutes(start) >= schedule.to_minutes(finish):
+        send(user_id, f"Не получится: рабочий день с {start} до {finish} "
+                      "выходит пустым или наоборот.")
+        show_work(user_id)
+        return
+
+    if which == "start":
+        schedule.set_work_schedule(start=moment)
+    else:
+        schedule.set_work_schedule(finish=moment)
+
+    send(user_id, f"Готово: {work_schedule_text()}.")
+    show_work(user_id)
+
+
+# --- разбор нажатий в кабинете -------------------------------------------
+
+def find_day(msg, days):
+    """День, чья подпись совпала с нажатой кнопкой, или None.
+
+    Списки дней всюду пересобираются на лету, поэтому кнопка из старого
+    сообщения просто не найдётся — и мастер увидит свежий список вместо
+    закрытия неизвестно чего.
+    """
+    for day in days:
+        if schedule.day_label(day).lower() == msg:
+            return day
+    return None
+
+
+def handle_owner(user_id, msg, text):
+    """Все шаги кабинета. Что это владелец, вызывающий уже проверил.
+
+    msg — приведённое к нижнему регистру сообщение, им сравниваются кнопки.
+    text — то, что мастер написал на самом деле: причина отмены уходит
+    клиенту как есть, и превращать её в «заболела, простите» нельзя.
+    """
+    user = get_user(user_id)
+    state = user["state"]
+
+    # Выход в кабинет работает на любом его экране — включая те, где ждут
+    # свободный текст: иначе из ввода причины было бы не выбраться.
+    if msg == TO_CABINET.lower():
+        show_cabinet(user_id)
+        return
+
+    if state == OWNER_CABINET:
+        if msg == SCHEDULE_BUTTON.lower():
+            show_schedule_days(user_id)
+        elif msg == CLOSE_BUTTON.lower():
+            ask_close_kind(user_id)
+        elif msg == CLOSURES_BUTTON.lower():
+            show_closures(user_id)
+        elif msg == WORK_BUTTON.lower():
+            show_work(user_id)
+        else:
+            send(user_id, "Не поняла. Выберите кнопку ниже:")
+            show_cabinet(user_id)
+        return
+
+    # --- расписание ---
+    if state == OWNER_SCHEDULE:
+        if msg == OTHER_SCHEDULE_DAY.lower():
+            show_schedule_days(user_id)
+            return
+
+        day = user.get("schedule_day")
+        if day and msg.isdigit():
+            # Список читаем заново: пока мастер смотрел, запись могли отменить.
+            bookings = schedule.day_bookings(day)
+            if 1 <= int(msg) <= len(bookings):
+                ask_cancel_reason(user_id, bookings[int(msg) - 1])
+                return
+
+        chosen = find_day(msg, [day for day, _ in schedule.days_with_bookings()])
+        if chosen:
+            show_schedule_day(user_id, chosen)
+            return
+
+        send(user_id, "Не поняла. Выберите день или номер записи:")
+        show_schedule_days(user_id)
+        return
+
+    if state == OWNER_CANCEL_REASON:
+        reason = clean_reason(text)
+        if not reason:
+            send(user_id, "Напишите причину текстом — её увидит клиент.")
+            return
+        do_master_cancel(user_id, reason)
+        return
+
+    # --- закрытие времени ---
+    if state == OWNER_CLOSE_KIND:
+        if msg == CLOSE_PAUSE.lower():
+            user["close_kind"] = CLOSE_PAUSE
+            user["close_since"] = date.today().isoformat()
+            user["close_until"] = (date.today()
+                                   + timedelta(days=PAUSE_DAYS)).isoformat()
+            ask_close_reason(user_id)
+        elif msg in (CLOSE_WHOLE_DAY.lower(), CLOSE_HOURS.lower(),
+                     CLOSE_PERIOD.lower()):
+            user["close_kind"] = {
+                CLOSE_WHOLE_DAY.lower(): CLOSE_WHOLE_DAY,
+                CLOSE_HOURS.lower(): CLOSE_HOURS,
+                CLOSE_PERIOD.lower(): CLOSE_PERIOD,
+            }[msg]
+            ask_close_since(user_id)
+        else:
+            ask_close_kind(user_id)
+        return
+
+    # Дальше идут шаги, которым нужен собранный черновик. Его нет — значит
+    # бота перезапустили на середине: возвращаем мастера в кабинет.
+    if state in (OWNER_CLOSE_SINCE, OWNER_CLOSE_UNTIL, OWNER_CLOSE_FROM,
+                 OWNER_CLOSE_TO, OWNER_CLOSE_REASON, OWNER_CLOSE_CONFIRM):
+        if user.get("close_kind") is None:
+            show_cabinet(user_id)
+            return
+
+    if state == OWNER_CLOSE_SINCE:
+        day = find_day(msg, schedule.upcoming_work_days(CLOSE_DAYS_TO_SHOW))
+        if day is None:
+            ask_close_since(user_id)
+            return
+
+        user["close_since"] = day
+        if user["close_kind"] == CLOSE_PERIOD:
+            ask_close_until(user_id)
+        elif user["close_kind"] == CLOSE_HOURS:
+            user["close_until"] = day  # отлучка всегда внутри одного дня
+            ask_close_from(user_id)
+        else:
+            user["close_until"] = day
+            ask_close_reason(user_id)
+        return
+
+    if state == OWNER_CLOSE_UNTIL:
+        later = [day for day in schedule.upcoming_work_days(CLOSE_DAYS_TO_SHOW * 2)
+                 if day > user["close_since"]][:CLOSE_DAYS_TO_SHOW]
+        day = find_day(msg, later)
+        if day is None:
+            ask_close_until(user_id)
+            return
+        user["close_until"] = day
+        ask_close_reason(user_id)
+        return
+
+    if state == OWNER_CLOSE_FROM:
+        if msg not in schedule.work_hours():
+            ask_close_from(user_id)
+            return
+        user["close_from"] = msg
+        ask_close_to(user_id)
+        return
+
+    if state == OWNER_CLOSE_TO:
+        if msg not in schedule.work_hours(first=user["close_from"]):
+            ask_close_to(user_id)
+            return
+        user["close_to"] = msg
+        ask_close_reason(user_id)
+        return
+
+    if state == OWNER_CLOSE_REASON:
+        reason = clean_reason(text)
+        if not reason:
+            send(user_id, "Напишите причину текстом — её увидят клиенты.")
+            return
+        user["close_reason"] = reason
+        ask_close_confirm(user_id)
+        return
+
+    if state == OWNER_CLOSE_CONFIRM:
+        if msg == CLOSE_YES.lower():
+            do_close(user_id)
+        elif msg == CLOSE_NO.lower():
+            send(user_id, "Ничего не закрыла.")
+            show_cabinet(user_id)
+        else:
+            ask_close_confirm(user_id)
+        return
+
+    if state == OWNER_CLOSURES:
+        closures = schedule.all_closures()
+        if msg.isdigit() and 1 <= int(msg) <= len(closures):
+            do_open(user_id, closures[int(msg) - 1])
+            return
+        send(user_id, "Не поняла. Нажмите номер закрытия:")
+        show_closures(user_id)
+        return
+
+    # --- рабочий график ---
+    if state == OWNER_WORK:
+        if msg == WORKDAYS_BUTTON.lower():
+            show_workdays(user_id)
+        elif msg == WORK_START_BUTTON.lower():
+            ask_work_hour(user_id, "start")
+        elif msg == WORK_END_BUTTON.lower():
+            ask_work_hour(user_id, "end")
+        else:
+            show_work(user_id)
+        return
+
+    if state == OWNER_WORKDAYS:
+        if msg == WORK_DONE.lower():
+            show_work(user_id)
+            return
+        # Подпись кнопки — «✅ Пн», поэтому ищем по названию дня, а не целиком:
+        # значок в ней меняется от нажатия к нажатию.
+        for number, name in enumerate(schedule.WEEKDAYS):
+            if msg.endswith(name.lower()):
+                toggle_workday(user_id, number)
+                return
+        show_workdays(user_id)
+        return
+
+    if state in (OWNER_WORK_START, OWNER_WORK_END):
+        which = "start" if state == OWNER_WORK_START else "end"
+        if msg.count(":") == 1 and msg.replace(":", "").isdigit():
+            set_work_hour(user_id, which, msg)
+            return
+        ask_work_hour(user_id, which)
+        return
+
+    # Шаг кабинета, которого мы не знаем, — то же, что неизвестный шаг
+    # у клиента: честно возвращаем в начало, а не молчим.
+    print(f"неизвестный шаг кабинета {state!r} — возвращаю в кабинет")
+    show_cabinet(user_id)
 
 
 # =========================================================================
@@ -1168,6 +2325,37 @@ def send_reminder(booking):
         print(f"не смогла напомнить {booking['user_id']}: {error}")
 
 
+def send_day_reminder(booking):
+    """Напомнить в день процедуры: «сегодня, ждём вас».
+
+    Подтверждение к этому моменту уже получено вчера, поэтому и разговор
+    другой: не «придёте?», а адрес и время. Отсюда и клавиатура без
+    «Подтверждаю» — подтверждать нечего, а вот сорваться в последний момент
+    человек может, и кнопка отмены должна быть под рукой.
+
+    Отметку ставим ДО отправки, как и в напоминании за сутки: если VK
+    откажется принять сообщение, напоминание пропадёт — зато мы не будем
+    пробовать снова каждую минуту до самой процедуры.
+    """
+    if not schedule.mark_day_reminded(booking["id"]):
+        return  # кто-то успел раньше
+
+    text = (
+        f"Сегодня ждём вас в {booking['start']}!\n\n"
+        f"Процедура: {config.SERVICES[booking['service']]['title']}\n"
+        f"Продолжительность: {format_duration(booking['minutes'])}\n"
+        f"Стоимость: {booking['price_from']}–{booking['price_to']} ₽\n\n"
+        f"{contacts()}\n\n"
+        "Если планы изменились — отмените запись, "
+        "я сразу предложу это время другим."
+    )
+
+    try:
+        send(booking["user_id"], text, DAY_REMINDER_KEYBOARD)
+    except ApiError as error:
+        print(f"не смогла напомнить {booking['user_id']}: {error}")
+
+
 def ready_to_expire(booking):
     """Клиент успел увидеть напоминание и ответить?
 
@@ -1203,6 +2391,12 @@ def do_expire(booking):
         print(f"не смогла написать {expired['user_id']}: {error}")
 
     # Дальше как при обычной отмене: время освободилось, и его кто-то ждёт.
+    #
+    # Про позднюю отмену тут не пишем: автоотмена всегда поздняя (за 12 часов
+    # до процедуры), и приписка была бы в каждом таком сообщении.
+    notify_owner("Запись снята: клиент не подтвердил\n\n"
+                 f"{booking_card(expired)}\n\n"
+                 f"{client_card(expired['user_id'])}")
     notify_subscribers(expired)
 
 
@@ -1238,6 +2432,13 @@ def scheduler_tick():
     for booking in schedule.due_expired():
         if ready_to_expire(booking):
             do_expire(booking)
+
+    # Напоминание в день записи — последним. Порядок важен: запись, которую
+    # только что сняли за неподтверждение, до сюда уже не доедет (её статус
+    # больше не активен), и клиент не получит «сегодня ждём вас» через
+    # секунду после «запись снята».
+    for booking in schedule.due_day_reminders():
+        send_day_reminder(booking)
 
 
 def run_scheduler():
@@ -1310,9 +2511,22 @@ def handle_message(user_id, text):
         # состояния и разобрана выше.
         if msg == "узнать стоимость":
             ask_service(user_id)
+        elif msg == CABINET_BUTTON.lower() and is_owner(user_id):
+            # Единственная дверь в кабинет. Здесь же и проверка владельца:
+            # слово «кабинет», написанное клиентом, ничего не открывает.
+            show_cabinet(user_id)
         else:
-            send(user_id, "Не понял. Выбери кнопку ниже:",
-                 menu_keyboard(user_id))
+            # Любое непонятное сообщение здесь — это «здравствуйте».
+            #
+            # Живой человек начинает не с «начать», а с «Здравствуйте, можно
+            # записаться на кератин?». Раньше первым, что он слышал от бота,
+            # было «Не понял» — худшее из возможных первых впечатлений, да
+            # ещё и неправдой: бот прекрасно знает, что делать дальше.
+            #
+            # Повтор приветствия тому, кто пишет мимо кнопок второй раз,
+            # не мешает, а помогает: раз он не понял, что нажимать, объяснить
+            # ещё раз полезнее, чем упрекнуть.
+            show_menu(user_id, greeting=True)
         return
 
     # --- выбор процедуры ---
@@ -1329,7 +2543,12 @@ def handle_message(user_id, text):
     if state == SELECTING_LENGTH:
         key = find_key(config.LENGTHS, msg)
         if key is None:
-            send(user_id, "Выберите длину волос кнопкой ниже:", LENGTH_KEYBOARD)
+            # Подсказки повторяем: клиент, который ответил мимо кнопок, как раз
+            # и есть тот, кто не понял вопроса.
+            send(user_id,
+                 "Выберите длину волос кнопкой ниже:\n\n"
+                 + hints_text(config.LENGTHS),
+                 LENGTH_KEYBOARD)
         else:
             user["length"] = key
             ask_density(user_id)
@@ -1339,7 +2558,10 @@ def handle_message(user_id, text):
     if state == SELECTING_DENSITY:
         key = find_key(config.DENSITIES, msg)
         if key is None:
-            send(user_id, "Выберите густоту волос кнопкой ниже:", DENSITY_KEYBOARD)
+            send(user_id,
+                 "Выберите густоту волос кнопкой ниже:\n\n"
+                 + hints_text(config.DENSITIES),
+                 DENSITY_KEYBOARD)
         else:
             user["density"] = key
             show_price(user_id)  # все параметры собраны — считаем
@@ -1364,7 +2586,8 @@ def handle_message(user_id, text):
         # Ищем день, чья подпись совпала с нажатой кнопкой.
         # Список берём тот же самый, так что «протухшие» кнопки из старого
         # сообщения просто не найдутся — и клиент увидит свежие дни.
-        for day in schedule.work_days(user["minutes"]):
+        for day in schedule.work_days(user["minutes"],
+                                      user.get("move_id")):
             if schedule.day_label(day).lower() == msg:
                 ask_time(user_id, day)
                 return
@@ -1395,7 +2618,8 @@ def handle_message(user_id, text):
             ask_time(user_id, user["day"], page - 1)
             return
 
-        if msg in schedule.free_slots(user["day"], user["minutes"]):
+        if msg in schedule.free_slots(user["day"], user["minutes"],
+                                      exclude_id=user.get("move_id")):
             show_confirmation(user_id, msg)
             return
         send(user_id, "Это время недоступно. Выберите из свободных:")
@@ -1417,7 +2641,8 @@ def handle_message(user_id, text):
         # Список пересобираем на лету: пока клиент думал, день мог
         # освободиться и уйти из «занятых». Тогда кнопка не найдётся,
         # и мы честно покажем свежий список.
-        for day in schedule.busy_days(user["minutes"]):
+        for day in schedule.busy_days(user["minutes"],
+                                      user.get("move_id")):
             if schedule.day_label(day).lower() == msg:
                 ask_sub_confirm(user_id, day)
                 return
@@ -1470,12 +2695,25 @@ def handle_message(user_id, text):
 
     # --- подтверждение отмены ---
     if state == CANCEL_CONFIRM:
-        if msg == CANCEL_YES.lower():
+        if msg == MOVE_BOOKING.lower():
+            start_move(user_id)
+        elif msg == CANCEL_YES.lower():
             do_cancel(user_id)
         elif msg == CANCEL_NO.lower():
             show_my_bookings(user_id)
         else:
             send(user_id, "Выбери кнопку ниже:", CANCEL_KEYBOARD)
+        return
+
+    # --- кабинет владельца ---
+    if state in OWNER_STATES:
+        # Проверяем владельца и здесь, а не только при показе кнопки: шаг
+        # лежит в базе и переживает перезапуск, а OWNER_ID в настройках между
+        # запусками мог поменяться. Чужого на этих шагах уводим в меню.
+        if is_owner(user_id):
+            handle_owner(user_id, msg, text)
+        else:
+            show_menu(user_id)
         return
 
     # --- шаг, которого мы не знаем ---
@@ -1491,6 +2729,12 @@ def handle_message(user_id, text):
 # =========================================================================
 # 12. Точка входа: бесконечное прослушивание сообщений
 # =========================================================================
+
+# База открывается здесь, в главном потоке, до всего остального. Не ради
+# скорости: connect() сверяет версию схемы и на чужой базе останавливает бота
+# понятным текстом. Сделай это первым фоновый поток — SystemExit убил бы
+# только его, а бот продолжил бы работать без напоминаний.
+db.connect()
 
 # daemon=True — поток не мешает боту завершиться: по Ctrl+C процесс закроется,
 # не дожидаясь, пока планировщик доспит свою минуту.

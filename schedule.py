@@ -24,11 +24,13 @@ import db
 #   REMINDED  — бот напомнил и ждёт подтверждения;
 #   CONFIRMED — клиент подтвердил, что придёт;
 #   CANCELLED — отменил сам;
-#   EXPIRED   — отменилась сама, подтверждения так и не было.
+#   EXPIRED   — отменилась сама, подтверждения так и не было;
+#   MOVED     — клиент перенёс её на другое время, вместо неё есть новая.
 #
-# Первые три занимают время в расписании, последние два — нет: окошко снова
-# свободно. Отмену клиента и автоотмену различаем, чтобы в истории было видно,
-# что произошло: «передумал» и «не выходит на связь» — разные истории.
+# Первые три занимают время в расписании, последние три — нет: окошко снова
+# свободно. Отмену клиента, автоотмену и перенос различаем, чтобы в истории
+# было видно, что произошло: «передумал», «не выходит на связь» и «перенёс» —
+# разные истории, и мастеру они говорят разное.
 #
 # Набор статусов повторён в схеме базы (CHECK у колонки status): база не даст
 # записать статус, которого здесь нет.
@@ -98,6 +100,48 @@ def moment_key(moment):
 
 
 # =========================================================================
+# 1а. Рабочий график мастера
+# =========================================================================
+# Дни недели и часы лежат в базе, а config.py задаёт значения по умолчанию:
+# мастер меняет график из переписки, но свежая копия проекта работает и без
+# единой строки в settings.
+#
+# Значения читаются из базы при каждом обращении, без запоминания в памяти.
+# Обращений много — free_slots() спрашивает границы дня на каждом шаге сетки,
+# то есть сотни раз за перебор двух недель, — но это сотни крошечных выборок
+# из таблицы в три строки, вместе меньше миллисекунды. Зато нет ни устаревшей
+# копии в памяти, ни вопроса, кто и когда её сбрасывает, ни разницы между
+# потоком диалога и планировщиком.
+
+def work_weekdays():
+    """Рабочие дни недели: [0, 1, 2, 3, 4, 5], где 0 — понедельник."""
+    saved = db.get_setting("work_days")
+    if saved is None:
+        return config.WORK_DAYS
+    return [int(part) for part in saved.split(",") if part]
+
+
+def work_start():
+    """Начало рабочего дня, «10:00»."""
+    return db.get_setting("work_start") or config.WORK_START
+
+
+def work_end():
+    """Конец рабочего дня: процедура должна успеть закончиться до него."""
+    return db.get_setting("work_end") or config.WORK_END
+
+
+def set_work_schedule(days=None, start=None, finish=None):
+    """Сохранить график. Меняется только то, что передали."""
+    if days is not None:
+        db.set_setting("work_days", ",".join(str(day) for day in sorted(days)))
+    if start is not None:
+        db.set_setting("work_start", start)
+    if finish is not None:
+        db.set_setting("work_end", finish)
+
+
+# =========================================================================
 # 2. База: откуда берутся записи
 # =========================================================================
 # Все запросы к таблице bookings живут в этом файле и ниже. Про SQL знает
@@ -143,9 +187,201 @@ def get_booking(booking_id):
     return db.query_one("SELECT * FROM bookings WHERE id = ?", (booking_id,))
 
 
+def days_with_bookings():
+    """Ближайшие дни, где кто-то записан: [("2026-08-03", 2), ...].
+
+    Для расписания мастера. Пустые дни в список не попадают — их и так видно
+    по отсутствию: в дне, которого здесь нет, свободно всё рабочее время.
+
+    Считаем в Python, а не запросом с GROUP BY: записи на две недели вперёд
+    всё равно уже прочитаны одним bookings_ahead(), и второй поход в базу
+    ради подсчёта строк, которых десятки, ничего не сэкономит.
+    """
+    days = {}
+    for booking in bookings_ahead():
+        if booking["status"] not in ACTIVE_STATUSES:
+            continue
+        days[booking["date"]] = days.get(booking["date"], 0) + 1
+
+    return sorted(days.items())
+
+
+def day_bookings(day):
+    """Активные записи одного дня по возрастанию времени.
+
+    Отличается от bookings_on(): та отдаёт всё подряд, включая отменённые,
+    потому что её ответ идёт в расчёт занятости. Здесь же список читает
+    человек, и отменённым записям в нём делать нечего.
+    """
+    return db.query(
+        f"SELECT * FROM bookings WHERE date = ? "
+        f"AND status IN ({placeholders(ACTIVE_STATUSES)}) "
+        f"ORDER BY start",
+        (day,) + ACTIVE_STATUSES,
+    )
+
+
+# =========================================================================
+# 2а. Закрытое время: когда мастер не принимает
+# =========================================================================
+# Одна таблица на четыре случая — выходной, отлучка на пару часов, отпуск
+# и пауза «пока не открою», — потому что для расписания это одно и то же:
+# отрезок, в который записаться нельзя. Устройство строки — в db.py.
+#
+# Закрытие само записи не отменяет: их отменяет мастер и с причиной, которую
+# получат клиенты. Здесь только «когда закрыто».
+
+def closures_ahead():
+    """Закрытия, задевающие ближайшие дни, на которые открыта запись.
+
+    Как bookings_ahead(): один запрос на весь перебор двух недель. Прошлые
+    закрытия не мешаются — они уже никого не касаются.
+    """
+    today = date.today()
+    last = today + timedelta(days=config.DAYS_AHEAD)
+
+    return db.query(
+        "SELECT * FROM closures WHERE until >= ? AND since <= ? "
+        "ORDER BY since, start",
+        (today.isoformat(), last.isoformat()),
+    )
+
+
+def all_closures():
+    """Все незакончившиеся закрытия — для экрана «что закрыто»."""
+    return db.query(
+        "SELECT * FROM closures WHERE until >= ? ORDER BY since, start",
+        (date.today().isoformat(),),
+    )
+
+
+def get_closure(closure_id):
+    """Закрытие по номеру или None."""
+    return db.query_one("SELECT * FROM closures WHERE id = ?", (closure_id,))
+
+
+def day_closures(day, closures=None):
+    """Закрытия, накрывающие этот день."""
+    if closures is None:
+        closures = closures_ahead()
+    return [closure for closure in closures
+            if closure["since"] <= day <= closure["until"]]
+
+
+def closed_intervals(day, closures=None):
+    """Закрытые отрезки дня в минутах: [(720, 900)] — это 12:00–15:00.
+
+    Закрытие без часов означает весь день: возвращаем сутки целиком, и дальше
+    оно работает как любой другой занятый отрезок. Отдельной ветки «а если
+    день закрыт» ни у кого не появляется.
+    """
+    intervals = []
+
+    for closure in day_closures(day, closures):
+        if closure["start"] is None or closure["finish"] is None:
+            return [(0, 24 * 60)]
+        intervals.append((to_minutes(closure["start"]),
+                          to_minutes(closure["finish"])))
+
+    return intervals
+
+
+def closed_all_day(day, closures=None):
+    """День закрыт целиком?"""
+    return closed_intervals(day, closures) == [(0, 24 * 60)]
+
+
+def closure_reason(day, closures=None):
+    """Чем мастер объяснил закрытие этого дня. Пусто — если день открыт."""
+    reasons = [closure["reason"] for closure in day_closures(day, closures)]
+    return reasons[0] if reasons else ""
+
+
+def add_closure(since, until, start, finish, reason):
+    """Закрыть время. Возвращает добавленную строку.
+
+    Пересечения с уже закрытым не ищем и не склеиваем: два закрытия на одно
+    время дают тот же результат, а разбираться потом, какое из них чьё,
+    мастеру было бы сложнее, чем снять лишнее.
+    """
+    closure = {
+        "since": since,
+        "until": until,
+        "start": start,
+        "finish": finish,
+        "reason": reason,
+    }
+    columns = list(closure)
+
+    closure["id"] = db.insert(
+        f"INSERT INTO closures ({', '.join(columns)}) "
+        f"VALUES ({placeholders(columns)})",
+        [closure[column] for column in columns],
+    )
+    return closure
+
+
+def remove_closure(closure_id):
+    """Снять закрытие. True — если было что снимать.
+
+    Здесь строка именно удаляется: истории «когда мастер был занят» никто
+    не ведёт, а отменённые из-за закрытия записи остались в базе со своей
+    причиной — по ним всё и восстанавливается.
+    """
+    return db.execute("DELETE FROM closures WHERE id = ?", (closure_id,)) > 0
+
+
+def bookings_in_closure(since, until, start, finish):
+    """Активные записи, попавшие в закрываемое время.
+
+    Нужны дважды: показать мастеру, скольким людям придётся написать, и потом
+    отменить их разом. Отбор по дате делает база, а по часам — Python:
+    сравнение отрезков в SQL пришлось бы писать строками, и читалось бы оно
+    совсем непонятно.
+    """
+    found = db.query(
+        f"SELECT * FROM bookings WHERE date BETWEEN ? AND ? "
+        f"AND status IN ({placeholders(ACTIVE_STATUSES)}) "
+        f"ORDER BY date, start",
+        (since, until) + ACTIVE_STATUSES,
+    )
+
+    if start is None or finish is None:
+        return found  # закрыт весь день, попали все
+
+    closed_start, closed_finish = to_minutes(start), to_minutes(finish)
+    inside = []
+
+    for booking in found:
+        booking_start = to_minutes(booking["start"])
+        booking_end = booking_start + booking["minutes"]
+        # Та же проверка пересечения, что и в is_free(), только без уборки:
+        # процедура, закончившаяся ровно к отлучке, мастеру не мешает.
+        if booking_end <= closed_start or booking_start >= closed_finish:
+            continue
+        inside.append(booking)
+
+    return inside
+
+
 # =========================================================================
 # 3. Занятость времени
 # =========================================================================
+
+def without(bookings, booking_id):
+    """Тот же список записей, но без одной — той, которую сейчас переносят.
+
+    При переносе запись не должна мешать сама себе. Клиент, который двигает
+    процедуру с 12:00 на 12:30, целится в те самые часы, которые эта запись
+    и занимает: не убрав её из расчёта, мы показали бы ему день без единого
+    подходящего окошка и никуда не пустили.
+
+    booking_id = None означает обычную запись — тогда список не меняется.
+    """
+    if booking_id is None:
+        return bookings
+    return [booking for booking in bookings if booking["id"] != booking_id]
+
 
 def busy_intervals(bookings, day):
     """Занятые отрезки конкретного дня — в минутах, уже с уборкой на конце.
@@ -165,23 +401,30 @@ def busy_intervals(bookings, day):
     return intervals
 
 
-def is_free(bookings, day, start, minutes):
+def is_free(bookings, day, start, minutes, closed=()):
     """Можно ли начать процедуру в это время?
 
-    start и minutes — числа (минуты). Проверяем три вещи:
-    рабочие часы, пересечение с чужими записями, конец рабочего дня.
+    start и minutes — числа (минуты). Проверяем четыре вещи: рабочие часы,
+    конец рабочего дня, пересечение с чужими записями и с тем временем,
+    которое мастер закрыл.
+
+    closed — уже посчитанные отрезки закрытого времени этого дня
+    (closed_intervals). Приходят снаружи по той же причине, что и bookings:
+    перебирая две недели, мы читаем их из базы один раз, а не на каждый день.
     """
-    if start < to_minutes(config.WORK_START):
+    if start < to_minutes(work_start()):
         return False
 
     # Сама процедура должна закончиться до конца рабочего дня.
     # Уборка после последнего клиента в рабочие часы уже не обязана влезть.
-    if start + minutes > to_minutes(config.WORK_END):
+    if start + minutes > to_minutes(work_end()):
         return False
 
     end = start + minutes + config.CLEANUP_MINUTES
 
-    for busy_start, busy_end in busy_intervals(bookings, day):
+    # Закрытое мастером время ведёт себя ровно как чужая запись: разница
+    # только в том, откуда взялся отрезок. Поэтому и проверка одна.
+    for busy_start, busy_end in busy_intervals(bookings, day) + list(closed):
         # Два отрезка НЕ пересекаются только если один целиком раньше другого.
         # Всё остальное — наложение, значит время занято.
         if end <= busy_start or start >= busy_end:
@@ -197,11 +440,11 @@ def earliest_start(day):
     Для будущих дней — с начала рабочего дня. Для сегодня — не раньше,
     чем через MIN_LEAD_MINUTES от текущего момента: клиенту нужно доехать.
     """
-    work_start = to_minutes(config.WORK_START)
+    work_start_minutes = to_minutes(work_start())
 
     now = datetime.now()
     if day != now.strftime("%Y-%m-%d"):
-        return work_start
+        return work_start_minutes
 
     limit = now.hour * 60 + now.minute + config.MIN_LEAD_MINUTES
 
@@ -210,48 +453,102 @@ def earliest_start(day):
     if remainder:
         limit += config.SLOT_STEP - remainder
 
-    return max(work_start, limit)
+    return max(work_start_minutes, limit)
 
 
-def free_slots(day, minutes, bookings=None):
+def free_slots(day, minutes, bookings=None, exclude_id=None, closures=None):
     """Список свободных начал процедуры в этот день: ["10:00", "10:30", ...].
 
-    bookings можно передать снаружи, чтобы не спрашивать базу на каждый день,
-    когда мы проверяем сразу две недели вперёд.
+    bookings и closures можно передать снаружи, чтобы не спрашивать базу
+    на каждый день, когда мы проверяем сразу две недели вперёд.
+
+    exclude_id — номер записи, которую клиент переносит: для него её время
+    свободно, см. without().
     """
     if bookings is None:
         bookings = bookings_on(day)
+    if closures is None:
+        closures = closures_ahead()
+
+    bookings = without(bookings, exclude_id)
+    closed = closed_intervals(day, closures)
 
     slots = []
     start = earliest_start(day)
-    last_start = to_minutes(config.WORK_END) - minutes
+    last_start = to_minutes(work_end()) - minutes
 
     while start <= last_start:
-        if is_free(bookings, day, start, minutes):
+        if is_free(bookings, day, start, minutes, closed):
             slots.append(to_time(start))
         start += config.SLOT_STEP
 
     return slots
 
 
-def work_days(minutes):
+def upcoming_work_days(count):
+    """Ближайшие рабочие дни подряд, без оглядки на занятость.
+
+    В отличие от work_days(), который отбирает дни для клиента, здесь нужен
+    просто календарь: мастер закрывает день независимо от того, есть ли в нём
+    свободные окошки и записан ли кто-нибудь.
+    """
+    days = []
+    today = date.today()
+
+    for shift in range(config.DAYS_AHEAD + 1):
+        day = today + timedelta(days=shift)
+        if day.weekday() in work_weekdays():
+            days.append(day.isoformat())
+        if len(days) == count:
+            break
+
+    return days
+
+
+def work_hours(first=None):
+    """Часы рабочего дня кнопками: ["10:00", "11:00", ...].
+
+    Для экранов мастера, где он выбирает границы отлучки. Шаг — час, а не
+    SLOT_STEP: отлучиться на «с 12:30 до 14:30» бывает нужно редко, зато
+    вдвое меньше кнопок, и они помещаются в клавиатуру без листания.
+
+    first — показывать только время после него: «по» не может быть раньше «с».
+    """
+    hours = []
+    start = to_minutes(work_start())
+    limit = to_minutes(work_end())
+
+    while start <= limit:
+        moment = to_time(start)
+        if first is None or moment > first:
+            hours.append(moment)
+        start += 60
+
+    return hours
+
+
+def work_days(minutes, exclude_id=None):
     """Ближайшие рабочие дни, где есть хотя бы одно свободное окошко.
 
     Возвращает список строк-дат. Дни без окон в список не попадают —
     нет смысла показывать кнопку, за которой пусто.
+
+    exclude_id — переносимая запись: день, целиком занятый ею одной, для
+    этого клиента свободен, и в список он попасть обязан.
     """
-    bookings = bookings_ahead()  # один запрос на весь перебор
+    bookings = bookings_ahead()   # один запрос на весь перебор
+    closures = closures_ahead()  # и один на закрытия
     days = []
     today = date.today()
 
     for shift in range(config.DAYS_AHEAD):
         day = today + timedelta(days=shift)
 
-        if day.weekday() not in config.WORK_DAYS:
+        if day.weekday() not in work_weekdays():
             continue  # выходной мастера
 
         key = day.strftime("%Y-%m-%d")
-        if not free_slots(key, minutes, bookings):
+        if not free_slots(key, minutes, bookings, exclude_id, closures):
             continue  # день целиком занят
 
         days.append(key)
@@ -261,7 +558,7 @@ def work_days(minutes):
     return days
 
 
-def busy_days(minutes):
+def busy_days(minutes, exclude_id=None):
     """Ближайшие рабочие дни, где окошка под эту процедуру НЕТ.
 
     Обратная сторона work_days(): там дни, куда можно записаться, здесь —
@@ -271,18 +568,22 @@ def busy_days(minutes):
     отменится через час, запас MIN_LEAD_MINUTES до конца дня уже не влезет.
     """
     bookings = bookings_ahead()
+    closures = closures_ahead()
     days = []
     today = date.today()
 
     for shift in range(1, config.DAYS_AHEAD):
         day = today + timedelta(days=shift)
 
-        if day.weekday() not in config.WORK_DAYS:
+        if day.weekday() not in work_weekdays():
             continue  # выходной мастера
 
         key = day.strftime("%Y-%m-%d")
-        if free_slots(key, minutes, bookings):
+        if free_slots(key, minutes, bookings, exclude_id, closures):
             continue  # окошки есть — это день для записи, а не для подписки
+
+        if closed_all_day(key, closures):
+            continue  # мастер не принимает: ждать тут нечего
 
         days.append(key)
         if len(days) == config.DAYS_TO_SHOW:
@@ -333,6 +634,73 @@ def create_booking(user_id, day, start, minutes, service, length, density,
             return None
 
         # Номер выдаёт база, поэтому он появляется в записи только сейчас.
+        booking["id"] = db.insert(
+            f"INSERT INTO bookings ({', '.join(columns)}) "
+            f"VALUES ({placeholders(columns)})",
+            [booking[column] for column in columns],
+        )
+
+    return booking
+
+
+def move_booking(booking_id, user_id, day, start, minutes, service, length,
+                 density, price_from, price_to):
+    """Перенести запись на другое время. Возвращает новую запись или None.
+
+    Отмена и новая запись одним неделимым действием — в этом весь смысл.
+    Если делать по очереди («сначала отмени, потом запишись заново»), между
+    двумя шагами старое время уже улетит подписчикам, а нового может не
+    оказаться: клиент останется вообще без записи. Здесь же не сложилось —
+    значит не изменилось ничего.
+
+    Старая запись получает статус MOVED, а не CANCELLED: в истории мастера
+    «перенёс» и «передумал» — разные события.
+
+    None означает, что время заняли, пока клиент выбирал, или что переносить
+    уже нечего. Оба случая для диалога одинаковы: показать свежие окошки.
+    """
+    booking = {
+        "user_id": user_id,
+        "date": day,
+        "start": start,
+        "minutes": minutes,
+        "service": service,
+        "length": length,
+        "density": density,
+        "price_from": price_from,
+        "price_to": price_to,
+        "status": "NEW",
+    }
+
+    # Та же логика, что и у новой записи: до процедуры меньше суток —
+    # спрашивать «придёте?» уже не о чем.
+    if minutes_left(booking) <= config.CONFIRM_BEFORE_HOURS * 60:
+        booking["status"] = "CONFIRMED"
+
+    columns = ["user_id", "date", "start", "minutes", "service", "length",
+               "density", "price_from", "price_to", "status"]
+
+    with db.transaction():
+        old = db.query_one(
+            f"SELECT id FROM bookings WHERE id = ? AND user_id = ? "
+            f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
+            (booking_id, user_id) + ACTIVE_STATUSES,
+        )
+        if old is None:
+            return None  # чужая, отменённая или уже перенесённая
+
+        # Себе самой запись не мешает: при переносе внутри одного дня она
+        # занимает как раз то время, рядом с которым клиент и выбирает.
+        # Без этого исключения перенос с 14:00 на 14:30 был бы невозможен.
+        others = [other for other in bookings_on(day)
+                  if other["id"] != booking_id]
+
+        if not is_free(others, day, to_minutes(start), minutes):
+            return None
+
+        db.execute("UPDATE bookings SET status = 'MOVED' WHERE id = ?",
+                   (booking_id,))
+
         booking["id"] = db.insert(
             f"INSERT INTO bookings ({', '.join(columns)}) "
             f"VALUES ({placeholders(columns)})",
@@ -413,6 +781,58 @@ def cancel_booking(booking_id, user_id):
         return None
 
     return get_booking(booking_id)
+
+
+def cancel_by_master(booking_id, reason):
+    """Отменить запись от лица мастера. Возвращает запись или None.
+
+    Отдельный статус, а не CANCELLED: для мастера «клиент передумал»
+    и «я сам отменил» — разные строки в истории, и путать их нельзя. Причина
+    ложится в саму запись, чтобы её можно было показать и через неделю,
+    а не только в том сообщении, которое клиент мог не прочитать.
+
+    Владельца, в отличие от cancel_booking(), не проверяем: отменяет мастер,
+    и любая активная запись ему подвластна. Условие по статусу внутри UPDATE
+    оставляем — оно защищает от повторной отмены и от гонки с планировщиком.
+    """
+    changed = db.execute(
+        f"UPDATE bookings SET status = 'CANCELLED_BY_MASTER', "
+        f"cancel_reason = ? "
+        f"WHERE id = ? AND status IN ({placeholders(ACTIVE_STATUSES)})",
+        (reason, booking_id) + ACTIVE_STATUSES,
+    )
+
+    if not changed:
+        return None
+
+    return get_booking(booking_id)
+
+
+def cancel_many_by_master(bookings, reason):
+    """Отменить сразу несколько записей — одной причиной и одним действием.
+
+    Так мастер закрывает день: пятнадцать записей отменяются вместе, а не по
+    одной. Транзакция здесь не для скорости, а чтобы не получилось половины:
+    день закрыт, а часть клиентов об этом не знает и приедет.
+
+    Возвращает те записи, которые действительно отменились — им и пишем.
+    """
+    cancelled = []
+
+    with db.transaction():
+        for booking in bookings:
+            changed = db.execute(
+                f"UPDATE bookings SET status = 'CANCELLED_BY_MASTER', "
+                f"cancel_reason = ? "
+                f"WHERE id = ? AND status IN ({placeholders(ACTIVE_STATUSES)})",
+                (reason, booking["id"]) + ACTIVE_STATUSES,
+            )
+            if changed:
+                cancelled.append(dict(booking,
+                                      status="CANCELLED_BY_MASTER",
+                                      cancel_reason=reason))
+
+    return cancelled
 
 
 # =========================================================================
@@ -596,6 +1016,45 @@ def due_expired():
         return []  # автоотмена выключена в настройках
 
     return due_within("REMINDED", config.AUTOCANCEL_BEFORE_HOURS)
+
+
+def due_day_reminders():
+    """Записи, до которых остались часы: пора напомнить «сегодня, ждём».
+
+    Отличий от due_reminders() два. Во-первых, статус подходит любой активный:
+    к этому часу запись обычно уже CONFIRMED, но если автоотмена выключена
+    в настройках, она может остаться и REMINDED — напомнить надо всё равно.
+    Во-вторых, «уже напомнили» помнит не статус, а отдельная колонка: статус
+    здесь не меняется, и записать признак больше некуда.
+    """
+    if config.DAY_REMINDER_HOURS is None:
+        return []  # напоминание в день записи выключено в настройках
+
+    now = datetime.now()
+    limit = now + timedelta(hours=config.DAY_REMINDER_HOURS)
+
+    return db.query(
+        f"SELECT * FROM bookings WHERE day_reminded = 0 "
+        f"AND status IN ({placeholders(ACTIVE_STATUSES)}) "
+        f"AND date || ' ' || start > ? AND date || ' ' || start <= ? "
+        f"ORDER BY date, start",
+        ACTIVE_STATUSES + (moment_key(now), moment_key(limit)),
+    )
+
+
+def mark_day_reminded(booking_id):
+    """Отметить, что напоминание в день записи отправлено.
+
+    Возвращает True, если отметка поставлена именно сейчас. False означает,
+    что кто-то успел раньше — например, планировщик после перезапуска пошёл
+    по тому же списку. Условие day_reminded = 0 внутри UPDATE и делает эту
+    проверку неделимой: второе напоминание не уйдёт.
+    """
+    return db.execute(
+        "UPDATE bookings SET day_reminded = 1 "
+        "WHERE id = ? AND day_reminded = 0",
+        (booking_id,),
+    ) > 0
 
 
 def set_status(booking_id, new_status, allowed_from):
