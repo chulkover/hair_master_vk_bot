@@ -11,7 +11,8 @@
 
 Этот файл отвечает только за диалог с клиентом: состояния, клавиатуры,
 тексты. Расписание — в schedule.py, устройство базы — в db.py,
-настройки — в config.py.
+настройки — в config.py, а всё, что про сам мессенджер (отправка,
+клавиатуры, приём сообщений через ВК), — в messenger.py.
 """
 
 import os
@@ -19,18 +20,14 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 
-import vk_api
-from vk_api.exceptions import ApiError
-from vk_api.longpoll import VkLongPoll, VkEventType
-from vk_api.keyboard import VkKeyboard, VkKeyboardColor
-
 import config
-import db       # состояние диалога: чтобы шаг клиента не терялся при перезапуске
+import db        # состояние диалога: чтобы шаг клиента не терялся при перезапуске
+import messenger  # прослойка над мессенджером: весь код ВК спрятан за ней
 import schedule  # расписание: свободные окошки, записи, подписки
 
 
 # =========================================================================
-# 1. Часовой пояс и подключение к VK
+# 1. Часовой пояс и подключение к мессенджеру
 # =========================================================================
 # Пояс выставляем первым делом, до любого обращения ко времени: расписание,
 # напоминания и «сейчас» считаются в локальном времени, а на хостинге
@@ -49,21 +46,17 @@ def set_timezone():
 
 set_timezone()
 
-vk_session = vk_api.VkApi(token=config.VK_TOKEN)
-api = vk_session.get_api()
-longpoll = VkLongPoll(vk_session)
+# Мессенджер этого запуска. Какой именно (сейчас — ВКонтакте) выбирает
+# messenger.create() по настройке; дальше main.py зовёт только его методы
+# и про ВК ничего не знает. Всё, что ниже — send(), клавиатуры, приём
+# сообщений — это тонкие обёртки над bot, чтобы остальной код и тесты
+# обращались к привычным именам.
+bot = messenger.create()
 
 
 def send(user_id, text, keyboard=None):
     """Отправить сообщение пользователю (при желании — с клавиатурой)."""
-    params = {
-        "user_id": user_id,
-        "message": text,
-        "random_id": 0,  # 0 = VK сам не проверяет дубли, для учебного бота ок
-    }
-    if keyboard is not None:
-        params["keyboard"] = keyboard
-    api.messages.send(**params)
+    bot.send(user_id, text, keyboard)
 
 
 def notify_owner(text):
@@ -84,7 +77,7 @@ def notify_owner(text):
 
     try:
         send(config.OWNER_ID, text)
-    except ApiError as error:
+    except messenger.MessengerError as error:
         print(f"не смогла написать владельцу: {error}")
 
 
@@ -93,27 +86,14 @@ def client_name(user_id):
 
     Ссылка вида vk.com/id123456 мастеру не говорит ничего: чтобы понять, кто
     записался, ему пришлось бы открывать её в браузере. Имя он видит сразу
-    в сообщении.
-
-    Спрашиваем ВК при каждой отправке. Записей единицы в день, а своя таблица
-    клиентов с именами — это уже отдельное хозяйство, которое надо заполнять
-    и чистить.
-
-    Ловим любую ошибку, а не только ApiError: удалённая страница, оборванная
-    сеть или заглушка vk_api в тестах не должны мешать мастеру узнать о записи.
-    В худшем случае останется одна ссылка.
+    в сообщении. Как именно его узнаём — дело мессенджера, см. user_name().
     """
-    try:
-        person = api.users.get(user_ids=user_id)[0]
-        return f"{person['first_name']} {person['last_name']}".strip()
-    except Exception as error:
-        print(f"не смогла узнать имя {user_id}: {error}")
-        return ""
+    return bot.user_name(user_id)
 
 
 def client_card(user_id):
     """Кто клиент — строкой для сообщения мастеру: имя и ссылка на страницу."""
-    link = f"vk.com/id{user_id}"
+    link = bot.user_link(user_id)
     name = client_name(user_id)
     return f"Клиент: {name}\n{link}" if name else f"Клиент: {link}"
 
@@ -264,12 +244,9 @@ def save_user(user_id):
 BACK_TO_MENU = "В меню"
 
 
-# VK показывает у обычной клавиатуры не больше 5 рядов: сама библиотека
-# разрешает 10, но лишние ряды клиент просто не рисует, и кнопки из них
-# становятся недоступны. Поэтому 5 — наш настоящий лимит.
-MAX_KEYBOARD_ROWS = 5
-
 # В одном ряду не больше 5 кнопок — это уже ограничение библиотеки.
+# Про лимит на число рядов знает сам мессенджер (см. messenger.py): сколько
+# их поместится на экране — его забота, а не диалога.
 MAX_BUTTONS_IN_ROW = 5
 
 # А на телефоне комфортно влезают только 3 кнопки с текстом вроде «10:00»:
@@ -282,21 +259,11 @@ def build_keyboard(rows):
     """Собрать клавиатуру из списка рядов кнопок.
 
     rows — список списков: [["Кератин"], ["Ботокс"], ["В меню"]]
-    Каждый вложенный список — один ряд кнопок.
+    Каждый вложенный список — один ряд кнопок. Во что это превратится, решает
+    мессенджер: у ВК — VkKeyboard, у другого будет своё. Диалогу достаточно
+    отдать ряды подписей и получить назад готовую клавиатуру.
     """
-    # Не падаем, но громко жалуемся в консоль: молча потерянная кнопка —
-    # это часы поисков «почему у клиента нет выхода в меню».
-    if len(rows) > MAX_KEYBOARD_ROWS:
-        print(f"ВНИМАНИЕ: клавиатура из {len(rows)} рядов, "
-              f"VK покажет только первые {MAX_KEYBOARD_ROWS}: {rows}")
-
-    keyboard = VkKeyboard(one_time=False)
-    for i, row in enumerate(rows):
-        if i > 0:
-            keyboard.add_line()  # перенос на новый ряд, но не перед первым
-        for label in row:
-            keyboard.add_button(label, VkKeyboardColor.SECONDARY)
-    return keyboard.get_keyboard()
+    return bot.keyboard(rows)
 
 
 def chunk(items, size):
@@ -1268,7 +1235,7 @@ def notify_subscribers(cancelled):
 
         try:
             offer_free_slot(subscriber_id, subscription)
-        except ApiError as error:
+        except messenger.MessengerError as error:
             # Клиент закрыл сообщения от сообщества или удалил диалог.
             # Остальные подписчики тут не при чём — рассылку продолжаем.
             print(f"не смогла написать {subscriber_id}: {error}")
@@ -1674,7 +1641,7 @@ def do_master_cancel(user_id, reason):
             f"{contacts()}",
             menu_keyboard(booking["user_id"]),
         )
-    except ApiError as error:
+    except messenger.MessengerError as error:
         print(f"не смогла написать {booking['user_id']}: {error}")
         send(user_id, "Клиенту написать не получилось — сообщите ему сами.")
 
@@ -1879,7 +1846,7 @@ def do_close(user_id):
                 f"{contacts()}",
                 menu_keyboard(booking["user_id"]),
             )
-        except ApiError as error:
+        except messenger.MessengerError as error:
             failed += 1
             print(f"не смогла написать {booking['user_id']}: {error}")
 
@@ -2321,7 +2288,7 @@ def send_reminder(booking):
 
     try:
         send(booking["user_id"], text, REMINDER_KEYBOARD)
-    except ApiError as error:
+    except messenger.MessengerError as error:
         print(f"не смогла напомнить {booking['user_id']}: {error}")
 
 
@@ -2352,7 +2319,7 @@ def send_day_reminder(booking):
 
     try:
         send(booking["user_id"], text, DAY_REMINDER_KEYBOARD)
-    except ApiError as error:
+    except messenger.MessengerError as error:
         print(f"не смогла напомнить {booking['user_id']}: {error}")
 
 
@@ -2387,7 +2354,7 @@ def do_expire(booking):
             "время пока свободно.",
             menu_keyboard(expired["user_id"]),
         )
-    except ApiError as error:
+    except messenger.MessengerError as error:
         print(f"не смогла написать {expired['user_id']}: {error}")
 
     # Дальше как при обычной отмене: время освободилось, и его кто-то ждёт.
@@ -2745,35 +2712,30 @@ threading.Thread(target=run_scheduler, daemon=True).start()
 print(f"Бот запущен {datetime.now():%d.%m.%Y %H:%M} "
       f"({config.TIMEZONE}), база {db.DB_FILE}. Ctrl+C — остановить.")
 
-for event in longpoll.listen():
-    if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-        print(f"[{event.user_id}] {event.text}")
+for message in bot.listen():
+    print(f"[{message.user_id}] {message.text}")
 
-        # Замок на обработку и сохранение вместе: пока идёт разговор, фоновый
-        # поток не полезет в состояние этого же клиента со своим уведомлением.
-        with DIALOG_LOCK:
-            # try/except: если на одном сообщении что-то сломалось — пишем
-            # в консоль и слушаем дальше. Бот не должен падать целиком
-            # из-за одного клиента.
-            try:
-                handle_message(event.user_id, event.text)
-            except ApiError as error:
-                if error.code == 912:
-                    print(
-                        "Ошибка 912: у сообщества выключены «Возможности "
-                        "ботов».\nУправление сообществом -> Сообщения -> "
-                        "Настройки для бота -> Возможности ботов: Включены."
-                    )
-                else:
-                    print(f"VK вернул ошибку: {error}")
-            except Exception as error:
-                print(f"Ошибка при обработке сообщения: {error}")
+    # Замок на обработку и сохранение вместе: пока идёт разговор, фоновый
+    # поток не полезет в состояние этого же клиента со своим уведомлением.
+    with DIALOG_LOCK:
+        # try/except: если на одном сообщении что-то сломалось — пишем
+        # в консоль и слушаем дальше. Бот не должен падать целиком
+        # из-за одного клиента.
+        try:
+            handle_message(message.user_id, message.text)
+        except messenger.MessengerError as error:
+            # hint заполнен, когда у ошибки есть понятная человеку причина
+            # (например, у сообщества выключены «Возможности ботов»);
+            # иначе показываем общий текст.
+            print(error.hint or f"Мессенджер вернул ошибку: {error}")
+        except Exception as error:
+            print(f"Ошибка при обработке сообщения: {error}")
 
-            # Здесь, а не внутри handle_message(): у того около двадцати
-            # выходов, и сохранение пришлось бы дописывать в каждый. И именно
-            # после try/except — если обработка сломалась на середине,
-            # состояние уже могло измениться, и записать его надо всё равно.
-            try:
-                save_user(event.user_id)
-            except Exception as error:
-                print(f"Не смогла сохранить состояние диалога: {error}")
+        # Здесь, а не внутри handle_message(): у того около двадцати
+        # выходов, и сохранение пришлось бы дописывать в каждый. И именно
+        # после try/except — если обработка сломалась на середине,
+        # состояние уже могло измениться, и записать его надо всё равно.
+        try:
+            save_user(message.user_id)
+        except Exception as error:
+            print(f"Не смогла сохранить состояние диалога: {error}")
