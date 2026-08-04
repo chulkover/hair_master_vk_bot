@@ -346,14 +346,14 @@ check("на следующий день убирается снова", len(call
 db.cleanup = real_cleanup
 
 # А теперь настоящая уборка: она должна что-то удалить.
-db.save_dialog(777, {"state": "SELECTING_TIME"})
+db.save_dialog("vk", 777, {"state": "SELECTING_TIME"})
 db.execute("UPDATE dialogs SET seen_date = ? WHERE user_id = 777",
            ((date.today() - timedelta(days=config.KEEP_DIALOG_DAYS + 1))
             .isoformat(),))
 main.last_cleanup = None
 main.cleanup_once_a_day()
 check("брошенный диалог удалён настоящей уборкой",
-      db.load_dialog(777) is None)
+      db.load_dialog("vk", 777) is None)
 
 
 # --- 6. Живые данные ------------------------------------------------------

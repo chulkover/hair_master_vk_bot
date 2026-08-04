@@ -46,12 +46,30 @@ def set_timezone():
 
 set_timezone()
 
-# Мессенджер этого запуска. Какой именно (сейчас — ВКонтакте) выбирает
-# messenger.create() по настройке; дальше main.py зовёт только его методы
-# и про ВК ничего не знает. Всё, что ниже — send(), клавиатуры, приём
-# сообщений — это тонкие обёртки над bot, чтобы остальной код и тесты
-# обращались к привычным именам.
+# Мессенджеры этого запуска. Какие именно (сейчас — только ВКонтакте) выбирает
+# messenger.create() по настройке; дальше main.py зовёт методы bot и про ВК
+# ничего не знает. Всё, что ниже — send(), клавиатуры, приём сообщений —
+# тонкие обёртки над bot, чтобы остальной код и тесты обращались к привычным
+# именам.
 bot = messenger.create()
+
+# ВАЖНО: почти везде в этом файле параметр `user_id` — это не голый номер,
+# а messenger.Client(platform, id): кто и в каком мессенджере. База у ВК
+# и Telegram общая, а номера у них свои и могут совпасть, поэтому человека
+# опознаём парой. Числовой номер достаём как user_id.id, платформу —
+# user_id.platform. На границе с расписанием и базой пара распадается на два
+# явных аргумента (platform, user_id); внутри диалога она ходит одним Client.
+Client = messenger.Client
+
+
+def owner():
+    """Владелец как Client — по текущему config.OWNER_ID.
+
+    Считаем на месте, а не держим готовой константой: номер мастера читается
+    из настроек, и вычислять его каждый раз надёжнее, чем закешировать один
+    раз при импорте. Владелец всегда со стороны ВК: его номер — это VK ID.
+    """
+    return Client("vk", config.OWNER_ID)
 
 
 def send(user_id, text, keyboard=None):
@@ -76,7 +94,7 @@ def notify_owner(text):
         return  # уведомления выключены в настройках
 
     try:
-        send(config.OWNER_ID, text)
+        send(owner(), text)
     except messenger.MessengerError as error:
         print(f"не смогла написать владельцу: {error}")
 
@@ -96,6 +114,16 @@ def client_card(user_id):
     link = bot.user_link(user_id)
     name = client_name(user_id)
     return f"Клиент: {name}\n{link}" if name else f"Клиент: {link}"
+
+
+def client_of(row):
+    """Клиент записи или подписки как Client(platform, id).
+
+    Строки из базы несут platform и user_id отдельными столбцами; там, где
+    надо кому-то написать (напоминание, уведомление об отмене), собираем из
+    них обратно пару — по ней bot.send сам выберет нужный мессенджер.
+    """
+    return Client(row["platform"], row["user_id"])
 
 
 # =========================================================================
@@ -195,9 +223,13 @@ DIALOG_LOCK = threading.RLock()
 
 
 def get_user(user_id):
-    """Вернуть данные пользователя, при первой встрече подняв их из базы."""
+    """Вернуть данные пользователя, при первой встрече подняв их из базы.
+
+    user_id — это Client(platform, id); в памяти (users) он и служит ключом,
+    а базе передаётся распавшимся на два столбца.
+    """
     if user_id not in users:
-        saved = db.load_dialog(user_id)
+        saved = db.load_dialog(user_id.platform, user_id.id)
         users[user_id] = revive(saved) if saved else {"state": MAIN_MENU}
     return users[user_id]
 
@@ -232,9 +264,9 @@ def save_user(user_id):
         return  # до get_user() дело не дошло — сохранять нечего
 
     if user["state"] == MAIN_MENU:
-        db.forget_dialog(user_id)
+        db.forget_dialog(user_id.platform, user_id.id)
     else:
-        db.save_dialog(user_id, user)
+        db.save_dialog(user_id.platform, user_id.id, user)
 
 
 # =========================================================================
@@ -363,7 +395,7 @@ CLOSE_DAYS_TO_SHOW = 9
 
 def my_bookings_button(user_id):
     """«Мои записи» или «Мои записи (3/5)», если записи есть."""
-    count = schedule.active_count(user_id)
+    count = schedule.active_count(user_id.platform, user_id.id)
     if count == 0:
         return MY_BOOKINGS_BUTTON
     return f"{MY_BOOKINGS_BUTTON} ({count}/{config.MAX_ACTIVE_BOOKINGS})"
@@ -371,7 +403,7 @@ def my_bookings_button(user_id):
 
 def my_subs_button(user_id):
     """«Мои подписки (2/3)» — счётчик такой же, как у записей."""
-    count = len(schedule.user_subscriptions(user_id))
+    count = len(schedule.user_subscriptions(user_id.platform, user_id.id))
     if count == 0:
         return MY_SUBS_BUTTON
     return f"{MY_SUBS_BUTTON} ({count}/{config.MAX_SUBSCRIPTIONS})"
@@ -391,9 +423,9 @@ def menu_keyboard(user_id):
     ]
 
     sections = []
-    if schedule.active_count(user_id):
+    if schedule.active_count(user_id.platform, user_id.id):
         sections.append(my_bookings_button(user_id))
-    if schedule.user_subscriptions(user_id):
+    if schedule.user_subscriptions(user_id.platform, user_id.id):
         sections.append(my_subs_button(user_id))
     if sections:
         rows.append(sections)
@@ -402,7 +434,7 @@ def menu_keyboard(user_id):
     # и только у него: на других экранах она не появляется даже у владельца.
     # Так дела мастера не могут встретиться с его же записью как клиента —
     # из шага записи в кабинет просто нет двери.
-    if user_id == config.OWNER_ID:
+    if is_owner(user_id):
         rows.append([CABINET_BUTTON])
 
     return build_keyboard(rows)
@@ -730,7 +762,7 @@ def start_booking(user_id):
     и густоты мы не знаем, сколько времени занять в расписании. Разница
     одна — лимит: посчитать цену можно всегда, записаться нет.
     """
-    if schedule.limit_reached(user_id):
+    if schedule.limit_reached(user_id.platform, user_id.id):
         show_limit_message(user_id)
         return
 
@@ -765,7 +797,7 @@ def ask_date(user_id):
     # При переносе не проверяем: записей у клиента не прибавится, старая уйдёт
     # вместе с новой. Иначе клиент, набравший максимум, не смог бы передвинуть
     # ни одну из своих записей — а это ровно то, что ему в такой момент нужно.
-    if not user.get("move_id") and schedule.limit_reached(user_id):
+    if not user.get("move_id") and schedule.limit_reached(user_id.platform, user_id.id):
         show_limit_message(user_id)
         return
 
@@ -895,7 +927,7 @@ def save_booking(user_id):
     # была для удобства клиента, а эта — настоящая: она спрашивает базу
     # заново, поэтому видит записи, сделанные пока клиент выбирал время.
     # При переносе её нет по той же причине, что и в ask_date().
-    if not moving and schedule.limit_reached(user_id):
+    if not moving and schedule.limit_reached(user_id.platform, user_id.id):
         show_limit_message(user_id)
         return
 
@@ -912,7 +944,8 @@ def save_booking(user_id):
         return
 
     parameters = dict(
-        user_id=user_id,
+        platform=user_id.platform,
+        user_id=user_id.id,
         day=user["day"],
         start=user["time"],
         minutes=user["minutes"],
@@ -938,7 +971,7 @@ def save_booking(user_id):
         return
 
     # Клиент дождался своего дня и записался — ждать в нём больше нечего.
-    schedule.remove_subscription(user_id, booking["date"])
+    schedule.remove_subscription(user_id.platform, user_id.id, booking["date"])
 
     forget_move(user_id)
     user["state"] = MAIN_MENU
@@ -1041,7 +1074,7 @@ def ask_sub_confirm(user_id, day):
     user["sub_day"] = day
     user["state"] = SUB_CONFIRM
 
-    if schedule.is_subscribed(user_id, day):
+    if schedule.is_subscribed(user_id.platform, user_id.id, day):
         send(
             user_id,
             f"Вы уже подписаны на {schedule.pretty_date(day)} — "
@@ -1050,7 +1083,7 @@ def ask_sub_confirm(user_id, day):
         )
         return
 
-    if schedule.subscriptions_limit_reached(user_id):
+    if schedule.subscriptions_limit_reached(user_id.platform, user_id.id):
         # Состояние сбрасываем в меню, чтобы кнопка «Мои подписки» ниже
         # сразу работала — так же, как сделано с лимитом записей.
         user["state"] = MAIN_MENU
@@ -1084,7 +1117,8 @@ def do_subscribe(user_id):
     day = user["sub_day"]
 
     subscription = schedule.add_subscription(
-        user_id=user_id,
+        platform=user_id.platform,
+        user_id=user_id.id,
         day=day,
         minutes=user["minutes"],
         service=user["service"],
@@ -1121,7 +1155,7 @@ def show_my_subs(user_id):
     ничего не занимает, случайно снять её не страшно, а вернуть легко.
     """
     user = get_user(user_id)
-    subscriptions = schedule.user_subscriptions(user_id)
+    subscriptions = schedule.user_subscriptions(user_id.platform, user_id.id)
 
     if not subscriptions:
         user["state"] = MAIN_MENU
@@ -1158,7 +1192,7 @@ def do_unsubscribe(user_id, subscription):
     """Снять подписку и показать, что осталось."""
     day = subscription["date"]
 
-    if schedule.remove_subscription(user_id, day):
+    if schedule.remove_subscription(user_id.platform, user_id.id, day):
         send(user_id, f"Больше не жду для вас окошко "
                       f"{schedule.pretty_date(day)}.")
     else:
@@ -1218,27 +1252,29 @@ def notify_subscribers(cancelled):
     """
     day = cancelled["date"]
 
-    for subscription in schedule.day_subscribers(day):
-        subscriber_id = subscription["user_id"]
+    cancelled_by = Client(cancelled["platform"], cancelled["user_id"])
 
-        if subscriber_id == cancelled["user_id"]:
+    for subscription in schedule.day_subscribers(day):
+        subscriber = Client(subscription["platform"], subscription["user_id"])
+
+        if subscriber == cancelled_by:
             continue  # сам отменил — сам и освободил, сообщать нечего
 
         # Молчим, если записаться всё равно нельзя: клиент набрал максимум
         # записей, или освободившееся время короче его процедуры (free_slots
         # сама учтёт и уборку, и конец рабочего дня). Уведомление, из которого
         # нельзя записаться, — просто спам.
-        if schedule.limit_reached(subscriber_id):
+        if schedule.limit_reached(subscriber.platform, subscriber.id):
             continue
         if not schedule.free_slots(day, subscription["minutes"]):
             continue
 
         try:
-            offer_free_slot(subscriber_id, subscription)
+            offer_free_slot(subscriber, subscription)
         except messenger.MessengerError as error:
             # Клиент закрыл сообщения от сообщества или удалил диалог.
             # Остальные подписчики тут не при чём — рассылку продолжаем.
-            print(f"не смогла написать {subscriber_id}: {error}")
+            print(f"не смогла написать {subscriber.id}: {error}")
 
 
 # =========================================================================
@@ -1256,7 +1292,7 @@ STATUS_LABELS = {
 def show_my_bookings(user_id):
     """Показать активные записи клиента и кнопки отмены."""
     user = get_user(user_id)
-    bookings = schedule.user_bookings(user_id)
+    bookings = schedule.user_bookings(user_id.platform, user_id.id)
 
     if not bookings:
         user["state"] = MAIN_MENU
@@ -1348,7 +1384,8 @@ def start_move(user_id):
 def do_cancel(user_id):
     """Отменить запись и показать, что осталось."""
     user = get_user(user_id)
-    booking = schedule.cancel_booking(user["cancel_id"], user_id)
+    booking = schedule.cancel_booking(user["cancel_id"], user_id.platform,
+                                      user_id.id)
 
     if booking is None:
         send(user_id, "Не нашла эту запись — возможно, её уже отменили.")
@@ -1373,7 +1410,7 @@ def do_cancel(user_id):
 
 def do_confirm(user_id):
     """Клиент нажал «Подтверждаю»."""
-    confirmed = schedule.confirm_bookings(user_id)
+    confirmed = schedule.confirm_bookings(user_id.platform, user_id.id)
 
     if not confirmed:
         # Нажали кнопку из старого сообщения: всё уже подтверждено, ту запись
@@ -1406,7 +1443,7 @@ def start_cancel(user_id):
     спрашивали (REMINDED), а если такая не одна — просим выбрать номер:
     отмена необратима, угадывать тут нельзя.
     """
-    bookings = schedule.user_bookings(user_id)
+    bookings = schedule.user_bookings(user_id.platform, user_id.id)
 
     if not bookings:
         send(user_id, "Активных записей нет — отменять нечего.",
@@ -1469,7 +1506,7 @@ def is_owner(user_id):
     кнопка в меню и разбор каждого шага кабинета, — и разъехаться они
     не должны. Нулевой OWNER_ID владельцем не делает никого.
     """
-    return bool(config.OWNER_ID) and user_id == config.OWNER_ID
+    return bool(config.OWNER_ID) and user_id == owner()
 
 
 def forget_draft(user_id):
@@ -1571,7 +1608,7 @@ def show_schedule_day(user_id, day):
         lines.append(
             f"\n{number}. {booking['start']}–{schedule.end_time(booking)}  "
             f"{config.SERVICES[booking['service']]['title']}\n"
-            f"{client_card(booking['user_id'])}\n"
+            f"{client_card(client_of(booking))}\n"
             f"{config.LENGTHS[booking['length']]['title'].lower()}, "
             f"{config.DENSITIES[booking['density']]['title'].lower()}, "
             f"{booking['price_from']}–{booking['price_to']} ₽\n"
@@ -1605,7 +1642,7 @@ def ask_cancel_reason(user_id, booking):
         user_id,
         "Отменяем запись:\n\n"
         f"{booking_card(booking)}\n"
-        f"{client_card(booking['user_id'])}\n\n"
+        f"{client_card(client_of(booking))}\n\n"
         "Напишите причину — я передам её клиенту.",
         build_keyboard([[TO_CABINET, BACK_TO_MENU]]),
     )
@@ -1631,7 +1668,7 @@ def do_master_cancel(user_id, reason):
 
     try:
         send(
-            booking["user_id"],
+            client_of(booking),
             "Мастер отменил вашу запись 😔\n\n"
             f"{config.SERVICES[booking['service']]['title']}\n"
             f"{schedule.pretty_date(booking['date'])}, {booking['start']}\n\n"
@@ -1639,7 +1676,7 @@ def do_master_cancel(user_id, reason):
             "Извините за неудобство. Записаться на другое время можно кнопкой "
             "ниже — или напишите нам, подберём вместе.\n\n"
             f"{contacts()}",
-            menu_keyboard(booking["user_id"]),
+            menu_keyboard(client_of(booking)),
         )
     except messenger.MessengerError as error:
         print(f"не смогла написать {booking['user_id']}: {error}")
@@ -1835,7 +1872,7 @@ def do_close(user_id):
     for booking in cancelled:
         try:
             send(
-                booking["user_id"],
+                client_of(booking),
                 "Мастер отменил вашу запись 😔\n\n"
                 f"{config.SERVICES[booking['service']]['title']}\n"
                 f"{schedule.pretty_date(booking['date'])}, "
@@ -1844,7 +1881,7 @@ def do_close(user_id):
                 "Извините за неудобство. Как только смогу — запишу вас "
                 "на другое время, выберите его кнопкой ниже.\n\n"
                 f"{contacts()}",
-                menu_keyboard(booking["user_id"]),
+                menu_keyboard(client_of(booking)),
             )
         except messenger.MessengerError as error:
             failed += 1
@@ -2287,7 +2324,7 @@ def send_reminder(booking):
         )
 
     try:
-        send(booking["user_id"], text, REMINDER_KEYBOARD)
+        send(client_of(booking), text, REMINDER_KEYBOARD)
     except messenger.MessengerError as error:
         print(f"не смогла напомнить {booking['user_id']}: {error}")
 
@@ -2318,7 +2355,7 @@ def send_day_reminder(booking):
     )
 
     try:
-        send(booking["user_id"], text, DAY_REMINDER_KEYBOARD)
+        send(client_of(booking), text, DAY_REMINDER_KEYBOARD)
     except messenger.MessengerError as error:
         print(f"не смогла напомнить {booking['user_id']}: {error}")
 
@@ -2347,12 +2384,12 @@ def do_expire(booking):
 
     try:
         send(
-            expired["user_id"],
+            client_of(expired),
             f"Запись на {schedule.pretty_date(expired['date'])} "
             f"в {expired['start']} снята: подтверждения не было.\n\n"
             "Если планы не изменились, запишитесь заново — "
             "время пока свободно.",
-            menu_keyboard(expired["user_id"]),
+            menu_keyboard(client_of(expired)),
         )
     except messenger.MessengerError as error:
         print(f"не смогла написать {expired['user_id']}: {error}")
@@ -2363,7 +2400,7 @@ def do_expire(booking):
     # до процедуры), и приписка была бы в каждом таком сообщении.
     notify_owner("Запись снята: клиент не подтвердил\n\n"
                  f"{booking_card(expired)}\n\n"
-                 f"{client_card(expired['user_id'])}")
+                 f"{client_card(client_of(expired))}")
     notify_subscribers(expired)
 
 
@@ -2634,7 +2671,7 @@ def handle_message(user_id, text):
     if state == MY_BOOKINGS:
         # Список читаем заново: клиент мог отменить запись с другого
         # устройства, да и старое сообщение с кнопками никуда не девается.
-        bookings = schedule.user_bookings(user_id)
+        bookings = schedule.user_bookings(user_id.platform, user_id.id)
 
         # Цифры проверяем до преобразования, иначе «привет» уронит int().
         if msg.isdigit() and 1 <= int(msg) <= len(bookings):
@@ -2650,7 +2687,7 @@ def handle_message(user_id, text):
     if state == MY_SUBS:
         # Читаем заново по той же причине, что и записи: подписка могла
         # сняться сама, если клиент за это время записался на тот день.
-        subscriptions = schedule.user_subscriptions(user_id)
+        subscriptions = schedule.user_subscriptions(user_id.platform, user_id.id)
 
         if msg.isdigit() and 1 <= int(msg) <= len(subscriptions):
             do_unsubscribe(user_id, subscriptions[int(msg) - 1])
@@ -2713,7 +2750,7 @@ print(f"Бот запущен {datetime.now():%d.%m.%Y %H:%M} "
       f"({config.TIMEZONE}), база {db.DB_FILE}. Ctrl+C — остановить.")
 
 for message in bot.listen():
-    print(f"[{message.user_id}] {message.text}")
+    print(f"[{message.client.platform}:{message.client.id}] {message.text}")
 
     # Замок на обработку и сохранение вместе: пока идёт разговор, фоновый
     # поток не полезет в состояние этого же клиента со своим уведомлением.
@@ -2722,7 +2759,7 @@ for message in bot.listen():
         # в консоль и слушаем дальше. Бот не должен падать целиком
         # из-за одного клиента.
         try:
-            handle_message(message.user_id, message.text)
+            handle_message(message.client, message.text)
         except messenger.MessengerError as error:
             # hint заполнен, когда у ошибки есть понятная человеку причина
             # (например, у сообщества выключены «Возможности ботов»);
@@ -2736,6 +2773,6 @@ for message in bot.listen():
         # после try/except — если обработка сломалась на середине,
         # состояние уже могло измениться, и записать его надо всё равно.
         try:
-            save_user(message.user_id)
+            save_user(message.client)
         except Exception as error:
             print(f"Не смогла сохранить состояние диалога: {error}")

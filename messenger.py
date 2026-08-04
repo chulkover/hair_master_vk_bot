@@ -33,10 +33,18 @@ import config
 # Общие типы: одинаковые у любого мессенджера
 # =========================================================================
 
-# Входящее сообщение в том виде, в каком его ждёт главный цикл: от кого и что.
-# Больше боту знать не нужно — ни номера чата, ни типа события конкретной
-# библиотеки. Каждый мессенджер сам превращает своё событие в этот Incoming.
-Incoming = collections.namedtuple("Incoming", ["user_id", "text"])
+# Кто клиент: в каком мессенджере (platform) и под каким номером (id). Пара,
+# а не один номер, потому что база у ВК и Telegram общая, а номера у них свои
+# и вполне могут совпасть: ВК-12345 и TG-12345 — разные люди. Везде, где бот
+# опознаёт человека — состояние диалога, записи, подписки, — опознаёт он именно
+# этой парой. Числовой id нужен там, где надо обратиться в саму библиотеку
+# (кому слать) или собрать ссылку на страницу.
+Client = collections.namedtuple("Client", ["platform", "id"])
+
+# Входящее сообщение в том виде, в каком его ждёт главный цикл: от кого (Client)
+# и что (text). Больше боту знать не нужно — ни номера чата, ни типа события
+# конкретной библиотеки. Каждый мессенджер сам превращает своё событие в это.
+Incoming = collections.namedtuple("Incoming", ["client", "text"])
 
 
 class MessengerError(Exception):
@@ -118,7 +126,10 @@ class VkMessenger(Messenger):
     # ВК, поэтому и живёт оно здесь, а не в диалоге.
     MAX_KEYBOARD_ROWS = 5
 
-    def __init__(self, token):
+    def __init__(self, platform, token):
+        # Своё имя платформы («vk») мессенджер знает сам: им он подписывает
+        # входящие сообщения, чтобы бот понимал, в каком канале клиент.
+        self.platform = platform
         self._session = vk_api.VkApi(token=token)
         self._api = self._session.get_api()
         self._longpoll = VkLongPoll(self._session)
@@ -188,31 +199,99 @@ class VkMessenger(Messenger):
     def listen(self):
         for event in self._longpoll.listen():
             if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-                yield Incoming(event.user_id, event.text)
+                yield Incoming(Client(self.platform, event.user_id), event.text)
 
 
 # =========================================================================
-# Выбор мессенджера в момент запуска
+# Bot: маршрутизатор поверх нескольких мессенджеров
+# =========================================================================
+
+class Bot:
+    """Держит все включённые мессенджеры и шлёт через нужный.
+
+    Главная его задача — по платформе клиента выбрать тот мессенджер, которым
+    до этого клиента и правда достучаться. Клиента, записавшегося в Telegram,
+    напоминание должно найти в Telegram, а не в ВК: за это отвечает `by()`.
+
+    main.py обращается к боту клиентом (Client), а не голым номером, и потому
+    не думает, в каком канале человек: `bot.send(client, ...)` сам уедет туда,
+    куда надо.
+    """
+
+    def __init__(self, messengers):
+        self._messengers = messengers  # {"vk": VkMessenger(...), ...}
+
+    def by(self, platform):
+        """Мессенджер этой платформы — или понятная ошибка, если его нет.
+
+        «Нет мессенджера» означает запись из канала, который на этом запуске
+        не включён (в config.cfg только vk, а запись — из tg). Молчать нельзя:
+        клиент остался бы без напоминания, и никто бы не понял почему.
+        """
+        messenger = self._messengers.get(platform)
+        if messenger is None:
+            raise MessengerError(
+                f"нет включённого мессенджера для платформы «{platform}» — "
+                f"проверьте [bot] platform в config.cfg"
+            )
+        return messenger
+
+    def send(self, client, text, keyboard=None):
+        self.by(client.platform).send(client.id, text, keyboard)
+
+    def user_name(self, client):
+        return self.by(client.platform).user_name(client.id)
+
+    def user_link(self, client):
+        return self.by(client.platform).user_link(client.id)
+
+    def keyboard(self, rows, platform="vk"):
+        # Клавиатуру собирает конкретный мессенджер: у ВК это VkKeyboard.
+        # Пока канал один, платформа по умолчанию — vk; появится второй,
+        # клавиатуру нужно будет собирать под платформу получателя.
+        return self.by(platform).keyboard(rows)
+
+    def listen(self):
+        """Входящие сообщения всех включённых мессенджеров.
+
+        Пока мессенджер один — просто отдаём его поток. Когда каналов станет
+        несколько, каждый надо будет слушать своим потоком и сводить в общую
+        очередь; входящая часть до этого места ещё дойдёт, а доставка (send)
+        по платформе уже готова.
+        """
+        if len(self._messengers) == 1:
+            (only,) = self._messengers.values()
+            yield from only.listen()
+            return
+        raise NotImplementedError(
+            "Одновременное прослушивание нескольких мессенджеров ещё "
+            "не сделано — см. listen() в messenger.py."
+        )
+
+
+# =========================================================================
+# Выбор мессенджеров в момент запуска
 # =========================================================================
 
 def create():
-    """Собрать мессенджер, выбранный для этого запуска.
+    """Собрать бота с мессенджерами, выбранными для этого запуска.
 
-    Какой именно — решается здесь, в одном месте, по настройке `platform`
+    Какие включены — решается здесь, в одном месте, по настройке `platform`
     в разделе [bot] файла config.cfg. Сейчас мессенджер один, ВКонтакте, и он
     же стоит по умолчанию: раздела в настройках может не быть вовсе, старые
     установки от этого не сломаются.
 
     Ключ доступа каждый мессенджер берёт свой: у ВК это config.VK_TOKEN.
-    Появится Telegram — добавится ветка со своим токеном, и это единственное
-    место, которого коснётся правка. main.py не изменится.
+    Появится Telegram — здесь добавится ещё один мессенджер в словарь со своим
+    токеном, и это единственное место, которого коснётся правка. main.py
+    обращается к клиентам по платформе и не изменится.
     """
     platform = "vk"
     if config.SETTINGS.has_option("bot", "platform"):
         platform = config.SETTINGS.get("bot", "platform").strip().lower() or "vk"
 
     if platform == "vk":
-        return VkMessenger(config.VK_TOKEN)
+        return Bot({"vk": VkMessenger("vk", config.VK_TOKEN)})
 
     raise SystemExit(
         f"В настройках [bot] platform указан неизвестный мессенджер "

@@ -596,8 +596,8 @@ def busy_days(minutes, exclude_id=None):
 # 4. Создание записи
 # =========================================================================
 
-def create_booking(user_id, day, start, minutes, service, length, density,
-                   price_from, price_to):
+def create_booking(platform, user_id, day, start, minutes, service, length,
+                   density, price_from, price_to):
     """Проверить, что время свободно, и добавить запись.
 
     Возвращает саму запись — или None, если окошко уже заняли.
@@ -606,8 +606,12 @@ def create_booking(user_id, day, start, minutes, service, length, density,
     увидел кнопку: пока он думал, время мог занять кто-то другой. Проверка и
     вставка идут одной транзакцией: между «время свободно» и «записала» не
     должен влезть второй клиент с тем же окошком.
+
+    platform запоминаем вместе с записью: по нему потом решится, каким
+    мессенджером напомнить клиенту о визите.
     """
     booking = {
+        "platform": platform,
         "user_id": user_id,
         "date": day,
         "start": start,
@@ -626,8 +630,8 @@ def create_booking(user_id, day, start, minutes, service, length, density,
     if minutes_left(booking) <= config.CONFIRM_BEFORE_HOURS * 60:
         booking["status"] = "CONFIRMED"
 
-    columns = ["user_id", "date", "start", "minutes", "service", "length",
-               "density", "price_from", "price_to", "status"]
+    columns = ["platform", "user_id", "date", "start", "minutes", "service",
+               "length", "density", "price_from", "price_to", "status"]
 
     with db.transaction():
         if not is_free(bookings_on(day), day, to_minutes(start), minutes):
@@ -643,8 +647,8 @@ def create_booking(user_id, day, start, minutes, service, length, density,
     return booking
 
 
-def move_booking(booking_id, user_id, day, start, minutes, service, length,
-                 density, price_from, price_to):
+def move_booking(booking_id, platform, user_id, day, start, minutes, service,
+                 length, density, price_from, price_to):
     """Перенести запись на другое время. Возвращает новую запись или None.
 
     Отмена и новая запись одним неделимым действием — в этом весь смысл.
@@ -660,6 +664,7 @@ def move_booking(booking_id, user_id, day, start, minutes, service, length,
     уже нечего. Оба случая для диалога одинаковы: показать свежие окошки.
     """
     booking = {
+        "platform": platform,
         "user_id": user_id,
         "date": day,
         "start": start,
@@ -677,14 +682,14 @@ def move_booking(booking_id, user_id, day, start, minutes, service, length,
     if minutes_left(booking) <= config.CONFIRM_BEFORE_HOURS * 60:
         booking["status"] = "CONFIRMED"
 
-    columns = ["user_id", "date", "start", "minutes", "service", "length",
-               "density", "price_from", "price_to", "status"]
+    columns = ["platform", "user_id", "date", "start", "minutes", "service",
+               "length", "density", "price_from", "price_to", "status"]
 
     with db.transaction():
         old = db.query_one(
-            f"SELECT id FROM bookings WHERE id = ? AND user_id = ? "
-            f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
-            (booking_id, user_id) + ACTIVE_STATUSES,
+            f"SELECT id FROM bookings WHERE id = ? AND platform = ? "
+            f"AND user_id = ? AND status IN ({placeholders(ACTIVE_STATUSES)})",
+            (booking_id, platform, user_id) + ACTIVE_STATUSES,
         )
         if old is None:
             return None  # чужая, отменённая или уже перенесённая
@@ -721,7 +726,8 @@ def active_condition(only_future=True):
     запросах — это два места, где можно разойтись. Возвращаем кусок SQL и
     параметры к нему, чтобы условие было написано один раз.
     """
-    sql = f"user_id = ? AND status IN ({placeholders(ACTIVE_STATUSES)})"
+    sql = (f"platform = ? AND user_id = ? "
+           f"AND status IN ({placeholders(ACTIVE_STATUSES)})")
     params = ACTIVE_STATUSES
 
     if only_future:
@@ -732,16 +738,16 @@ def active_condition(only_future=True):
     return sql, params
 
 
-def user_bookings(user_id, only_future=True):
+def user_bookings(platform, user_id, only_future=True):
     """Активные записи одного клиента, по возрастанию даты."""
     condition, params = active_condition(only_future)
     return db.query(
         f"SELECT * FROM bookings WHERE {condition} ORDER BY date, start",
-        (user_id,) + params,
+        (platform, user_id) + params,
     )
 
 
-def active_count(user_id):
+def active_count(platform, user_id):
     """Сколько активных записей у клиента сейчас — это и есть его счётчик.
 
     Считает база: вытаскивать записи, чтобы тут же их посчитать, незачем.
@@ -749,16 +755,16 @@ def active_count(user_id):
     """
     condition, params = active_condition()
     row = db.query_one(f"SELECT count(*) AS n FROM bookings WHERE {condition}",
-                       (user_id,) + params)
+                       (platform, user_id) + params)
     return row["n"]
 
 
-def limit_reached(user_id):
+def limit_reached(platform, user_id):
     """Клиент уже набрал максимум активных записей?"""
-    return active_count(user_id) >= config.MAX_ACTIVE_BOOKINGS
+    return active_count(platform, user_id) >= config.MAX_ACTIVE_BOOKINGS
 
 
-def cancel_booking(booking_id, user_id):
+def cancel_booking(booking_id, platform, user_id):
     """Отменить запись клиента. Возвращает запись или None, если не нашли.
 
     Строку НЕ удаляем, а меняем статус на CANCELLED. Так у мастера остаётся
@@ -772,9 +778,9 @@ def cancel_booking(booking_id, user_id):
     """
     changed = db.execute(
         f"UPDATE bookings SET status = 'CANCELLED' "
-        f"WHERE id = ? AND user_id = ? "
+        f"WHERE id = ? AND platform = ? AND user_id = ? "
         f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
-        (booking_id, user_id) + ACTIVE_STATUSES,
+        (booking_id, platform, user_id) + ACTIVE_STATUSES,
     )
 
     if not changed:
@@ -852,21 +858,22 @@ def cancel_many_by_master(bookings, reason):
 # на месте: строка просто перестала что-либо значить, а убирает её db.cleanup().
 # Статус подписке поэтому не нужен.
 
-def user_subscriptions(user_id):
+def user_subscriptions(platform, user_id):
     """Подписки одного клиента, по возрастанию даты."""
     return db.query(
-        "SELECT * FROM subscriptions WHERE user_id = ? AND date >= ? "
+        "SELECT * FROM subscriptions "
+        "WHERE platform = ? AND user_id = ? AND date >= ? "
         "ORDER BY date",
-        (user_id, date.today().isoformat()),
+        (platform, user_id, date.today().isoformat()),
     )
 
 
-def subscriptions_count(user_id):
+def subscriptions_count(platform, user_id):
     """Сколько дней клиент сейчас ждёт."""
     row = db.query_one(
         "SELECT count(*) AS n FROM subscriptions "
-        "WHERE user_id = ? AND date >= ?",
-        (user_id, date.today().isoformat()),
+        "WHERE platform = ? AND user_id = ? AND date >= ?",
+        (platform, user_id, date.today().isoformat()),
     )
     return row["n"]
 
@@ -895,20 +902,21 @@ def has_bookings(day):
     return row["n"] > 0
 
 
-def is_subscribed(user_id, day):
+def is_subscribed(platform, user_id, day):
     """Клиент уже ждёт окошко в этот день?"""
     return db.query_one(
-        "SELECT 1 FROM subscriptions WHERE user_id = ? AND date = ?",
-        (user_id, day),
+        "SELECT 1 FROM subscriptions "
+        "WHERE platform = ? AND user_id = ? AND date = ?",
+        (platform, user_id, day),
     ) is not None
 
 
-def subscriptions_limit_reached(user_id):
+def subscriptions_limit_reached(platform, user_id):
     """Клиент уже набрал максимум подписок?"""
-    return subscriptions_count(user_id) >= config.MAX_SUBSCRIPTIONS
+    return subscriptions_count(platform, user_id) >= config.MAX_SUBSCRIPTIONS
 
 
-def add_subscription(user_id, day, minutes, service, length, density,
+def add_subscription(platform, user_id, day, minutes, service, length, density,
                      price_from, price_to):
     """Подписать клиента на день. Возвращает подписку или None.
 
@@ -923,6 +931,7 @@ def add_subscription(user_id, day, minutes, service, length, density,
     бы получить на одну подписку больше разрешённого.
     """
     subscription = {
+        "platform": platform,
         "user_id": user_id,
         "date": day,
         "minutes": minutes,
@@ -936,7 +945,7 @@ def add_subscription(user_id, day, minutes, service, length, density,
     columns = list(subscription)
 
     with db.transaction():
-        if subscriptions_count(user_id) >= config.MAX_SUBSCRIPTIONS:
+        if subscriptions_count(platform, user_id) >= config.MAX_SUBSCRIPTIONS:
             return None
 
         added = db.execute(
@@ -948,7 +957,7 @@ def add_subscription(user_id, day, minutes, service, length, density,
     return subscription if added else None
 
 
-def remove_subscription(user_id, day):
+def remove_subscription(platform, user_id, day):
     """Снять подписку клиента на день. True — если было что снимать.
 
     Вызывается и при отписке вручную, и когда клиент записался на этот
@@ -958,8 +967,9 @@ def remove_subscription(user_id, day):
     ждал» никому не нужна, а сам факт подписки ничего не бронировал.
     """
     return db.execute(
-        "DELETE FROM subscriptions WHERE user_id = ? AND date = ?",
-        (user_id, day),
+        "DELETE FROM subscriptions "
+        "WHERE platform = ? AND user_id = ? AND date = ?",
+        (platform, user_id, day),
     ) > 0
 
 
@@ -1091,7 +1101,7 @@ def expire_booking(booking_id):
     return set_status(booking_id, "EXPIRED", ("REMINDED",))
 
 
-def confirm_bookings(user_id):
+def confirm_bookings(platform, user_id):
     """Подтвердить записи, о которых бот спрашивал. Возвращает подтверждённые.
 
     Берём только те, что ждут ответа (ASKED_STATUS), и сразу все: клиент
@@ -1113,10 +1123,11 @@ def confirm_bookings(user_id):
 
     with db.transaction():
         confirmed = db.query(
-            "SELECT * FROM bookings WHERE user_id = ? AND status = ? "
+            "SELECT * FROM bookings "
+            "WHERE platform = ? AND user_id = ? AND status = ? "
             "AND date || ' ' || start > ? "  # прошедшую подтверждать нечего
             "ORDER BY date, start",
-            (user_id, ASKED_STATUS, now),
+            (platform, user_id, ASKED_STATUS, now),
         )
 
         if confirmed:

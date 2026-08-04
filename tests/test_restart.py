@@ -62,11 +62,21 @@ def check(name, condition, detail=""):
 CLIENT = 555
 
 
+def who(user_id):
+    """Клиент как main.Client(platform, id) — так его ждёт диалог.
+
+    Номер (CLIENT, OWNER) оставляем числом: он нужен и сырым — для запросов
+    к базе и проверок vk_api.SENT. А в main.* уходит уже парой, где платформа
+    у нас всегда «vk».
+    """
+    return main.Client("vk", user_id)
+
+
 def msg(text):
     """Сообщение от клиента — ровно так, как его обрабатывает главный цикл."""
     vk_api.SENT.clear()
-    main.handle_message(CLIENT, text)
-    main.save_user(CLIENT)
+    main.handle_message(who(CLIENT),text)
+    main.save_user(who(CLIENT))
     return [params["message"] for params in vk_api.SENT]
 
 
@@ -77,11 +87,11 @@ def restart():
 
 
 def state():
-    return main.get_user(CLIENT)["state"]
+    return main.get_user(who(CLIENT))["state"]
 
 
 def saved():
-    return db.load_dialog(CLIENT)
+    return db.load_dialog("vk", CLIENT)
 
 
 def work_day(min_shift=3):
@@ -99,8 +109,8 @@ msg("привет")
 check("клиент в меню", state() == main.MAIN_MENU)
 check("в базе строки нет", saved() is None, str(saved()))
 check("сохранение незнакомого клиента не падает",
-      main.save_user(999) is None)
-check("и строки ему не создаёт", db.load_dialog(999) is None)
+      main.save_user(who(999)) is None)
+check("и строки ему не создаёт", db.load_dialog("vk", 999) is None)
 
 
 # --- 2. Каждый шаг оказывается в базе -------------------------------------
@@ -136,10 +146,10 @@ restart()
 check("память пуста", main.users == {})
 check("шаг вернулся из базы", state() == "SELECTING_DATE")
 check("параметры процедуры вернулись",
-      main.get_user(CLIENT)["service"] == "keratin")
+      main.get_user(who(CLIENT))["service"] == "keratin")
 
 DAY = work_day()
-minutes = main.get_user(CLIENT)["minutes"]
+minutes = main.get_user(who(CLIENT))["minutes"]
 
 answers = msg(schedule.day_label(DAY).lower())
 print(f"     ответ бота: {answers[0][:50]!r}")
@@ -154,7 +164,7 @@ print("\n4. Перезапуск на выборе времени")
 
 restart()
 check("шаг вернулся", state() == "SELECTING_TIME")
-check("день вернулся", main.get_user(CLIENT)["day"] == DAY)
+check("день вернулся", main.get_user(who(CLIENT))["day"] == DAY)
 
 slot = schedule.free_slots(DAY, minutes)[0]
 msg(slot)
@@ -168,10 +178,10 @@ print("\n5. Перезапуск перед подтверждением")
 restart()
 check("шаг вернулся", state() == "CONFIRMING")
 
-before = len(schedule.user_bookings(CLIENT))
+before = len(schedule.user_bookings("vk", CLIENT))
 answers = msg("подтвердить запись")
 print(f"     ответ бота: {answers[0][:50]!r}")
-check("запись создалась", len(schedule.user_bookings(CLIENT)) == before + 1)
+check("запись создалась", len(schedule.user_bookings("vk", CLIENT)) == before + 1)
 check("клиент вернулся в меню", state() == main.MAIN_MENU)
 check("строка диалога удалена", saved() is None, str(saved()))
 
@@ -186,36 +196,36 @@ YESTERDAY = (date.today() - timedelta(days=1)).isoformat()
 PROCEDURE = {"service": "cold", "length": "short", "density": "thin",
              "minutes": 90, "price_from": 2100, "price_to": 2400}
 
-db.save_dialog(CLIENT, {"state": "SELECTING_TIME", "day": YESTERDAY,
+db.save_dialog("vk", CLIENT, {"state": "SELECTING_TIME", "day": YESTERDAY,
                         "page": 0, **PROCEDURE})
 restart()
 check("вчерашний день не поднимаем — в меню", state() == main.MAIN_MENU)
 check("мусор из состояния не притащился",
-      main.get_user(CLIENT) == {"state": main.MAIN_MENU},
-      str(main.get_user(CLIENT)))
+      main.get_user(who(CLIENT)) == {"state": main.MAIN_MENU},
+      str(main.get_user(who(CLIENT))))
 
-db.save_dialog(CLIENT, {"state": "SUB_CONFIRM", "sub_day": YESTERDAY,
+db.save_dialog("vk", CLIENT, {"state": "SUB_CONFIRM", "sub_day": YESTERDAY,
                         **PROCEDURE})
 restart()
 check("устаревший день подписки — тоже в меню", state() == main.MAIN_MENU)
 
-db.save_dialog(CLIENT, {"state": "SELECTING_TIME", "day": work_day(),
+db.save_dialog("vk", CLIENT, {"state": "SELECTING_TIME", "day": work_day(),
                         "page": 1, **PROCEDURE})
 restart()
 check("будущий день поднимается как есть", state() == "SELECTING_TIME")
-check("страница поднялась числом", main.get_user(CLIENT)["page"] == 1)
+check("страница поднялась числом", main.get_user(who(CLIENT))["page"] == 1)
 
 
 # --- 7. Состояние, выставленное фоновым потоком ---------------------------
 print("\n7. Уведомление о свободном окошке")
 
-main.users.pop(CLIENT, None)
-db.forget_dialog(CLIENT)
+main.users.pop(who(CLIENT), None)
+db.forget_dialog("vk", CLIENT)
 
 subscription = {"user_id": CLIENT, "date": DAY, **PROCEDURE}
 
 vk_api.SENT.clear()
-main.offer_free_slot(CLIENT, subscription)
+main.offer_free_slot(who(CLIENT), subscription)
 print(f"     сообщений клиенту: {len(vk_api.SENT)}")
 
 row = saved()
@@ -275,7 +285,7 @@ check("«Записаться» работает и из списка запис
 
 # Шаг, которого в коде больше нет: так выглядит строка, оставшаяся в базе
 # от прошлой версии бота.
-db.save_dialog(CLIENT, {"state": "ШАГ_ИЗ_ПРОШЛОЙ_ВЕРСИИ"})
+db.save_dialog("vk", CLIENT, {"state": "ШАГ_ИЗ_ПРОШЛОЙ_ВЕРСИИ"})
 restart()
 answers = msg("ага")
 check("на непонятном шаге бот не молчит", answers != [], str(answers))
@@ -286,7 +296,7 @@ check("и возвращает клиента в меню", state() == main.MAIN
 print("\n10. Подсказки на экранах выбора")
 
 main.users.clear()
-db.forget_dialog(CLIENT)
+db.forget_dialog("vk", CLIENT)
 
 msg("записаться")
 answers = msg("кератин")
@@ -333,35 +343,35 @@ config.OWNER_ID = OWNER
 def owner(text):
     """Сообщение от владельца — с тем же разбором, что и у клиента."""
     vk_api.SENT.clear()
-    main.handle_message(OWNER, text)
-    main.save_user(OWNER)
+    main.handle_message(who(OWNER),text)
+    main.save_user(who(OWNER))
     return " | ".join(params["message"] for params in vk_api.SENT)
 
 
 def owner_state():
-    return main.get_user(OWNER)["state"]
+    return main.get_user(who(OWNER))["state"]
 
 
 vk_api.SENT.clear()
-main.show_menu(CLIENT)
+main.show_menu(who(CLIENT))
 check("клиенту кнопку кабинета не показывают",
       main.CABINET_BUTTON not in vk_api.SENT[-1]["keyboard"])
 
 vk_api.SENT.clear()
-main.show_menu(OWNER)
+main.show_menu(who(OWNER))
 check("владельцу показывают",
       main.CABINET_BUTTON in vk_api.SENT[-1]["keyboard"])
 
-check("клиент владельцем не считается", main.is_owner(CLIENT) is False)
-check("владелец считается", main.is_owner(OWNER) is True)
+check("клиент владельцем не считается", main.is_owner(who(CLIENT)) is False)
+check("владелец считается", main.is_owner(who(OWNER)) is True)
 
 vk_api.SENT.clear()
-main.handle_message(CLIENT, "кабинет")
+main.handle_message(who(CLIENT),"кабинет")
 check("клиенту слово «кабинет» ничего не открывает",
-      main.get_user(CLIENT)["state"] == main.MAIN_MENU)
+      main.get_user(who(CLIENT))["state"] == main.MAIN_MENU)
 
 DAY = work_day(4)
-schedule.create_booking(CLIENT, DAY, "10:00", 90, "cold", "short", "thin",
+schedule.create_booking("vk", CLIENT,DAY, "10:00", 90, "cold", "short", "thin",
                         2100, 2400)
 
 answer = owner("кабинет")
@@ -377,10 +387,10 @@ check("день раскрылся по часам", "10:00" in answer, answer)
 check("с ссылкой на клиента", f"vk.com/id{CLIENT}" in answer)
 
 # Шаг владельца остался в базе, а владельцем этот номер быть перестал.
-main.get_user(CLIENT)["state"] = main.OWNER_SCHEDULE
-main.handle_message(CLIENT, schedule.day_label(DAY))
+main.get_user(who(CLIENT))["state"] = main.OWNER_SCHEDULE
+main.handle_message(who(CLIENT),schedule.day_label(DAY))
 check("чужого с шага кабинета уводит в меню",
-      main.get_user(CLIENT)["state"] == main.MAIN_MENU)
+      main.get_user(who(CLIENT))["state"] == main.MAIN_MENU)
 
 
 # --- 13. Уведомления владельцу --------------------------------------------
@@ -396,9 +406,10 @@ check("владельцу написали", len(to_owner) == 1, str(vk_api.SENT
 check("без клавиатуры", "keyboard" not in to_owner[0])
 
 check("имя клиента подставилось",
-      main.client_name(CLIENT) == "Мария Петрова", main.client_name(CLIENT))
+      main.client_name(who(CLIENT)) == "Мария Петрова", main.client_name(who(CLIENT)))
 check("незнакомый номер не роняет карточку",
-      main.client_card(404) == "Клиент: vk.com/id404", main.client_card(404))
+      main.client_card(who(404)) == "Клиент: vk.com/id404",
+      main.client_card(who(404)))
 
 saved_owner = config.OWNER_ID
 config.OWNER_ID = 0
@@ -412,15 +423,15 @@ config.OWNER_ID = saved_owner
 print("\n14. Перенос записи")
 
 main.users.clear()
-db.forget_dialog(CLIENT)
+db.forget_dialog("vk", CLIENT)
 
 # Записи от прошлых разделов убираем: перенос проверяем на одной, иначе
 # «нажмите номер 1» выберет неизвестно какую из накопившихся.
-for old in schedule.user_bookings(CLIENT):
-    schedule.cancel_booking(old["id"], CLIENT)
+for old in schedule.user_bookings("vk", CLIENT):
+    schedule.cancel_booking(old["id"], "vk", CLIENT)
 
 MOVE_FROM = work_day(4)
-moving = schedule.create_booking(CLIENT, MOVE_FROM, "10:00", 90, "cold",
+moving = schedule.create_booking("vk", CLIENT,MOVE_FROM, "10:00", 90, "cold",
                                  "short", "thin", 2100, 2400)
 
 msg("мои записи")
@@ -432,7 +443,7 @@ check("перенос попал в базу", saved()["move_id"] is not None, s
 
 restart()
 check("после перезапуска перенос помнится",
-      main.get_user(CLIENT).get("move_id") is not None)
+      main.get_user(who(CLIENT)).get("move_id") is not None)
 
 NEW_DAY = work_day(6)
 msg(schedule.day_label(NEW_DAY))
@@ -441,27 +452,27 @@ answers = msg("подтвердить запись")
 check("сказано, что перенесла", "Перенесла запись" in " ".join(answers),
       str(answers))
 check("активная запись одна и на новом дне",
-      [(b["date"], b["start"]) for b in schedule.user_bookings(CLIENT)]
-      == [(NEW_DAY, "12:00")], str(schedule.user_bookings(CLIENT)))
+      [(b["date"], b["start"]) for b in schedule.user_bookings("vk", CLIENT)]
+      == [(NEW_DAY, "12:00")], str(schedule.user_bookings("vk", CLIENT)))
 check("старая помечена перенесённой",
       schedule.get_booking(moving["id"])["status"] == "MOVED",
       schedule.get_booking(moving["id"])["status"])
 check("старое время снова свободно",
       "10:00" in schedule.free_slots(MOVE_FROM, 90))
-check("признак переноса забыт", "move_id" not in main.get_user(CLIENT))
+check("признак переноса забыт", "move_id" not in main.get_user(who(CLIENT)))
 
 
 # --- 15. Кабинет мастера --------------------------------------------------
 print("\n15. Кабинет мастера")
 
-for old in schedule.user_bookings(CLIENT):
-    schedule.cancel_booking(old["id"], CLIENT)
+for old in schedule.user_bookings("vk", CLIENT):
+    schedule.cancel_booking(old["id"], "vk", CLIENT)
 db.execute("DELETE FROM closures")
 main.users.clear()
 
 vk_api.PEOPLE[CLIENT] = ("Мария", "Петрова")
 CAB_DAY = work_day(4)
-victim = schedule.create_booking(CLIENT, CAB_DAY, "10:00", 90, "cold",
+victim = schedule.create_booking("vk", CLIENT,CAB_DAY, "10:00", 90, "cold",
                                  "short", "thin", 2100, 2400)
 
 # Отмена записи мастером: причина должна дойти до клиента как написана.
@@ -472,7 +483,7 @@ answer = owner("1")
 check("мастера спрашивают причину", "причину" in answer, answer)
 
 vk_api.SENT.clear()
-main.handle_message(OWNER, "Заболела, простите")
+main.handle_message(who(OWNER),"Заболела, простите")
 to_client = [params["message"] for params in vk_api.SENT
              if params["user_id"] == CLIENT]
 check("клиент получил сообщение", to_client != [], str(to_client))
@@ -486,7 +497,7 @@ check("причина сохранена в записи",
 
 # Закрытие дня с отменой того, что в нём есть.
 CLOSE_DAY = work_day(6)
-schedule.create_booking(CLIENT, CLOSE_DAY, "10:00", 90, "cold", "short",
+schedule.create_booking("vk", CLIENT,CLOSE_DAY, "10:00", 90, "cold", "short",
                         "thin", 2100, 2400)
 owner("кабинет")
 owner(main.CLOSE_BUTTON)
@@ -496,7 +507,7 @@ answer = owner("Уезжаю")
 check("показано, скольких заденет", "1 запись" in answer, answer)
 
 vk_api.SENT.clear()
-main.handle_message(OWNER, main.CLOSE_YES)
+main.handle_message(who(OWNER),main.CLOSE_YES)
 check("клиенту сообщили о закрытии",
       any(params["user_id"] == CLIENT for params in vk_api.SENT))
 check("день закрыт", schedule.closed_all_day(CLOSE_DAY))
@@ -531,10 +542,10 @@ check("перевёрнутый день отвергнут", "Не получи
 db.execute("DELETE FROM settings")
 
 # Чужой на шаге кабинета — в меню, и ничего не делает.
-main.get_user(CLIENT)["state"] = main.OWNER_CLOSE_KIND
-main.handle_message(CLIENT, main.CLOSE_PAUSE)
+main.get_user(who(CLIENT))["state"] = main.OWNER_CLOSE_KIND
+main.handle_message(who(CLIENT),main.CLOSE_PAUSE)
 check("клиента с шага кабинета уводит в меню",
-      main.get_user(CLIENT)["state"] == main.MAIN_MENU)
+      main.get_user(who(CLIENT))["state"] == main.MAIN_MENU)
 check("и он ничего не закрыл", schedule.all_closures() == [])
 
 

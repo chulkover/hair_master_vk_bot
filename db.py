@@ -34,12 +34,16 @@ DB_FILE = config.DB_FILE
 #   2 — напоминание в день записи (day_reminded), перенос (move_id, MOVED);
 #   3 — мастер управляет расписанием: закрытые дни и часы (closures),
 #       отмена записи мастером (cancel_reason, CANCELLED_BY_MASTER),
-#       рабочий график в базе, а не только в настройках (settings).
+#       рабочий график в базе, а не только в настройках (settings);
+#   4 — одна база на несколько мессенджеров: у диалогов, записей и подписок
+#       появилась колонка platform («vk», «tg»), и человек опознаётся парой
+#       (platform, user_id). Номера у ВК и Telegram свои и могут совпасть,
+#       поэтому одного user_id для этого уже мало.
 #
 # Механизма миграций в проекте нет: данные учебные, и базу проще удалить.
 # Но проверка версии при старте есть — см. connect(): база от старой версии
 # не должна молча приехать в новый код.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 # =========================================================================
@@ -52,7 +56,8 @@ SCHEMA_VERSION = 3
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bookings (
     id         INTEGER PRIMARY KEY,   -- он же rowid: номера выдаёт сама база
-    user_id    INTEGER NOT NULL,      -- VK ID клиента
+    platform   TEXT    NOT NULL DEFAULT 'vk',  -- мессенджер клиента: vk, tg
+    user_id    INTEGER NOT NULL,      -- номер клиента в этом мессенджере
     date       TEXT    NOT NULL,      -- 2026-08-03
     start      TEXT    NOT NULL,      -- 14:00 — начало процедуры
     minutes    INTEGER NOT NULL,      -- длительность процедуры, без уборки
@@ -75,7 +80,8 @@ CREATE TABLE IF NOT EXISTS bookings (
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
-    user_id    INTEGER NOT NULL,
+    platform   TEXT    NOT NULL DEFAULT 'vk',  -- мессенджер клиента: vk, tg
+    user_id    INTEGER NOT NULL,      -- номер клиента в этом мессенджере
     date       TEXT    NOT NULL,      -- день, окошка в котором клиент ждёт
     minutes    INTEGER NOT NULL,      -- окно короче не подойдёт
     service    TEXT    NOT NULL,
@@ -83,11 +89,12 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     density    TEXT    NOT NULL,
     price_from INTEGER NOT NULL,      -- цена на момент подписки
     price_to   INTEGER NOT NULL,
-    PRIMARY KEY (user_id, date)
+    PRIMARY KEY (platform, user_id, date)
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS dialogs (
-    user_id    INTEGER PRIMARY KEY,
+    platform   TEXT    NOT NULL DEFAULT 'vk',  -- мессенджер клиента: vk, tg
+    user_id    INTEGER NOT NULL,      -- номер клиента в этом мессенджере
     state      TEXT    NOT NULL,      -- MAIN_MENU, SELECTING_TIME, ...
     service    TEXT,
     length     TEXT,
@@ -101,7 +108,8 @@ CREATE TABLE IF NOT EXISTS dialogs (
     cancel_id  INTEGER,               -- какую запись отменяем
     move_id    INTEGER,               -- какую запись переносим
     sub_day    TEXT,                  -- день, на который подписываем
-    seen_date  TEXT    NOT NULL       -- последняя активность, нужна для уборки
+    seen_date  TEXT    NOT NULL,      -- последняя активность, нужна для уборки
+    PRIMARY KEY (platform, user_id)
 );
 
 -- Когда мастер не принимает. Одной таблицей закрываются четыре разных
@@ -336,28 +344,32 @@ def transaction():
 # сюда она попадает явным save_user(), поэтому перезапуск бота не сбивает
 # клиента с его шага.
 
-def load_dialog(user_id):
+def load_dialog(platform, user_id):
     """Состояние клиента или None, если бот его ещё не видел.
 
-    Пустые колонки в словарь не попадают. В памяти диалог устроен так же:
-    ключ появляется, когда клиент дошёл до этого шага. Иначе, например,
+    Клиент опознаётся парой (platform, user_id): в общей базе номер сам по себе
+    не уникален. Пустые колонки в словарь не попадают. В памяти диалог устроен
+    так же: ключ появляется, когда клиент дошёл до этого шага. Иначе, например,
     user.get("page", 0) вернул бы None вместо нуля.
     """
-    row = query_one("SELECT * FROM dialogs WHERE user_id = ?", (user_id,))
+    row = query_one(
+        "SELECT * FROM dialogs WHERE platform = ? AND user_id = ?",
+        (platform, user_id),
+    )
     if row is None:
         return None
     return {field: row[field] for field in DIALOG_FIELDS
             if row[field] is not None}
 
 
-def save_dialog(user_id, data):
+def save_dialog(platform, user_id, data):
     """Запомнить состояние клиента, заменив прежнее целиком.
 
     Полей немного и меняются они все вместе, поэтому дописывать по одному
     незачем: INSERT OR REPLACE просто кладёт новую строку вместо старой.
     """
-    columns = ["user_id"] + DIALOG_FIELDS + ["seen_date"]
-    values = ([user_id]
+    columns = ["platform", "user_id"] + DIALOG_FIELDS + ["seen_date"]
+    values = ([platform, user_id]
               + [data.get(field) for field in DIALOG_FIELDS]
               + [date.today().isoformat()])
 
@@ -368,9 +380,12 @@ def save_dialog(user_id, data):
     )
 
 
-def forget_dialog(user_id):
+def forget_dialog(platform, user_id):
     """Забыть клиента совсем. True — если было что забывать."""
-    return execute("DELETE FROM dialogs WHERE user_id = ?", (user_id,)) > 0
+    return execute(
+        "DELETE FROM dialogs WHERE platform = ? AND user_id = ?",
+        (platform, user_id),
+    ) > 0
 
 
 # =========================================================================

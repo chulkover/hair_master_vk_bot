@@ -205,13 +205,13 @@ check("другой клиент на тот же день — можно",
 # --- 5. состояние диалога ------------------------------------------------
 print("\n5. Диалог: сохранить, поднять, забыть")
 
-check("незнакомый клиент -> None", db.load_dialog(555) is None)
+check("незнакомый клиент -> None", db.load_dialog("vk", 555) is None)
 
-db.save_dialog(555, {"state": "SELECTING_TIME", "service": "keratin",
+db.save_dialog("vk", 555, {"state": "SELECTING_TIME", "service": "keratin",
                      "length": "long", "density": "thick", "minutes": 180,
                      "price_from": 6200, "price_to": 7300,
                      "day": day(3), "page": 1})
-loaded = db.load_dialog(555)
+loaded = db.load_dialog("vk", 555)
 print(f"     поднято: {loaded}")
 check("состояние вернулось", loaded["state"] == "SELECTING_TIME")
 check("параметры процедуры на месте", loaded["minutes"] == 180)
@@ -220,16 +220,16 @@ check("пустые поля в словарь не попали", "cancel_id" n
       str(loaded))
 check("get с запасным значением работает", loaded.get("page", 0) == 1)
 
-db.save_dialog(555, {"state": "MAIN_MENU"})
-loaded = db.load_dialog(555)
+db.save_dialog("vk", 555, {"state": "MAIN_MENU"})
+loaded = db.load_dialog("vk", 555)
 check("сохранение заменяет строку целиком", loaded == {"state": "MAIN_MENU"},
       str(loaded))
 check("одна строка на клиента",
       len(db.query("SELECT * FROM dialogs")) == 1)
 
-check("forget_dialog вернул True", db.forget_dialog(555) is True)
-check("клиент забыт", db.load_dialog(555) is None)
-check("забыть дважды нельзя", db.forget_dialog(555) is False)
+check("forget_dialog вернул True", db.forget_dialog("vk", 555) is True)
+check("клиент забыт", db.load_dialog("vk", 555) is None)
+check("забыть дважды нельзя", db.forget_dialog("vk", 555) is False)
 
 
 # --- 6. транзакция --------------------------------------------------------
@@ -289,7 +289,7 @@ db.insert(INSERT, (888, (TODAY - timedelta(days=config.KEEP_HISTORY_DAYS + 1))
                    .isoformat(), "10:00", 90, "cold", "short", "thin",
                    2300, 2700, "CANCELLED"))
 db.execute(SUB_INSERT, (888, day(-1), 90, "cold", "short", "thin", 2300, 2700))
-db.save_dialog(999, {"state": "MAIN_MENU"})
+db.save_dialog("vk", 999, {"state": "MAIN_MENU"})
 db.execute("UPDATE dialogs SET seen_date = ? WHERE user_id = 999",
            ((TODAY - timedelta(days=config.KEEP_DIALOG_DAYS + 1)).isoformat(),))
 
@@ -297,7 +297,7 @@ db.execute("UPDATE dialogs SET seen_date = ? WHERE user_id = 999",
 recent = db.insert(INSERT, (889, (TODAY - timedelta(days=10)).isoformat(),
                             "10:00", 90, "cold", "short", "thin",
                             2300, 2700, "CONFIRMED"))
-db.save_dialog(998, {"state": "SELECTING_TIME"})
+db.save_dialog("vk", 998, {"state": "SELECTING_TIME"})
 
 removed = db.cleanup()
 print(f"     удалено строк: {removed}")
@@ -306,10 +306,10 @@ check("старая запись удалена",
       db.query_one("SELECT * FROM bookings WHERE user_id = 888") is None)
 check("вчерашняя подписка удалена",
       db.query_one("SELECT * FROM subscriptions WHERE user_id = 888") is None)
-check("брошенный диалог удалён", db.load_dialog(999) is None)
+check("брошенный диалог удалён", db.load_dialog("vk", 999) is None)
 check("недавняя запись на месте",
       db.query_one("SELECT * FROM bookings WHERE id = ?", (recent,)) is not None)
-check("живой диалог на месте", db.load_dialog(998) is not None)
+check("живой диалог на месте", db.load_dialog("vk", 998) is not None)
 check("свежая подписка на месте",
       len(db.query("SELECT * FROM subscriptions")) == 2)
 check("уборка на убранной базе ничего не удаляет", db.cleanup() == 0)

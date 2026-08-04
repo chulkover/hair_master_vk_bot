@@ -89,7 +89,7 @@ print(f"\nдни для проверки: {DAY}, {DAY2}")
 # --- 1. Создание записи ---------------------------------------------------
 print("\n1. Создание записи")
 
-booking = schedule.create_booking(CLIENT, DAY, "12:00", 120, "cold", "short",
+booking = schedule.create_booking("vk",CLIENT, DAY, "12:00", 120, "cold", "short",
                                   "thin", 2100, 2400)
 print(f"     {booking}")
 check("запись создана", booking is not None)
@@ -102,15 +102,15 @@ check("в базе лежит то же самое",
 
 # То же время второй раз — занято.
 check("второй раз то же время нельзя",
-      schedule.create_booking(OTHER, DAY, "12:00", 120, "cold", "short",
+      schedule.create_booking("vk",OTHER, DAY, "12:00", 120, "cold", "short",
                               "thin", 2100, 2400) is None)
 
 # 13:30 попадает внутрь 12:00–14:00, 14:00–14:30 — уборка.
 check("наложение не проходит",
-      schedule.create_booking(OTHER, DAY, "13:30", 90, "cold", "short",
+      schedule.create_booking("vk",OTHER, DAY, "13:30", 90, "cold", "short",
                               "thin", 2100, 2400) is None)
 check("сразу после уборки — можно",
-      schedule.create_booking(OTHER, DAY, "14:30", 90, "cold", "short",
+      schedule.create_booking("vk",OTHER, DAY, "14:30", 90, "cold", "short",
                               "thin", 2100, 2400) is not None)
 check("в базе две записи",
       len(db.query("SELECT * FROM bookings")) == 2)
@@ -145,11 +145,11 @@ check("в пустом дне записей нет", schedule.has_bookings(DAY2
 # --- 3. Записи клиента ----------------------------------------------------
 print("\n3. Записи клиента и лимит")
 
-mine = schedule.user_bookings(CLIENT)
+mine = schedule.user_bookings("vk",CLIENT)
 check("клиенту видна только его запись",
       len(mine) == 1 and mine[0]["user_id"] == CLIENT, str(mine))
-check("счётчик совпадает со списком", schedule.active_count(CLIENT) == 1)
-check("лимит не достигнут", schedule.limit_reached(CLIENT) is False)
+check("счётчик совпадает со списком", schedule.active_count("vk",CLIENT) == 1)
+check("лимит не достигнут", schedule.limit_reached("vk",CLIENT) is False)
 
 # Прошедшая запись: в списке будущих её быть не должно.
 db.insert(
@@ -158,37 +158,37 @@ db.insert(
     (CLIENT, (date.today() - timedelta(days=2)).isoformat(), "10:00", 90,
      "cold", "short", "thin", 2100, 2400, "CONFIRMED"))
 check("прошедшая запись не в списке будущих",
-      len(schedule.user_bookings(CLIENT)) == 1)
+      len(schedule.user_bookings("vk",CLIENT)) == 1)
 check("а в полном списке — есть",
-      len(schedule.user_bookings(CLIENT, only_future=False)) == 2)
-check("в лимит прошедшая не идёт", schedule.active_count(CLIENT) == 1)
+      len(schedule.user_bookings("vk",CLIENT, only_future=False)) == 2)
+check("в лимит прошедшая не идёт", schedule.active_count("vk",CLIENT) == 1)
 
 # Список должен приходить по возрастанию времени.
-schedule.create_booking(CLIENT, DAY2, "10:00", 90, "cold", "short", "thin",
+schedule.create_booking("vk",CLIENT, DAY2, "10:00", 90, "cold", "short", "thin",
                         2100, 2400)
-mine = schedule.user_bookings(CLIENT)
+mine = schedule.user_bookings("vk",CLIENT)
 check("список по времени", [b["date"] for b in mine] == [DAY, DAY2], str(mine))
 
 
 # --- 4. Отмена ------------------------------------------------------------
 print("\n4. Отмена")
 
-check("чужую запись не отменить", schedule.cancel_booking(1, OTHER) is None)
-check("несуществующую тоже", schedule.cancel_booking(999, CLIENT) is None)
+check("чужую запись не отменить", schedule.cancel_booking(1, "vk", OTHER) is None)
+check("несуществующую тоже", schedule.cancel_booking(999, "vk", CLIENT) is None)
 
-cancelled = schedule.cancel_booking(1, CLIENT)
+cancelled = schedule.cancel_booking(1, "vk", CLIENT)
 check("своя отменяется", cancelled is not None and
       cancelled["status"] == "CANCELLED", str(cancelled))
-check("второй раз отменять нечего", schedule.cancel_booking(1, CLIENT) is None)
+check("второй раз отменять нечего", schedule.cancel_booking(1, "vk", CLIENT) is None)
 check("строка осталась в истории", schedule.get_booking(1) is not None)
 check("время снова свободно", "12:00" in schedule.free_slots(DAY, 90))
-check("из списка клиента ушла", len(schedule.user_bookings(CLIENT)) == 1)
+check("из списка клиента ушла", len(schedule.user_bookings("vk",CLIENT)) == 1)
 
 
 # --- 5. Статусы: напоминание и автоотмена ---------------------------------
 print("\n5. Статусы")
 
-fresh = schedule.create_booking(CLIENT, DAY, "12:00", 120, "cold", "short",
+fresh = schedule.create_booking("vk",CLIENT, DAY, "12:00", 120, "cold", "short",
                                 "thin", 2100, 2400)
 reminded = schedule.mark_reminded(fresh["id"])
 check("напоминание отмечено", reminded["status"] == "REMINDED", str(reminded))
@@ -250,7 +250,7 @@ config.AUTOCANCEL_BEFORE_HOURS = saved
 # --- 7. Подтверждение -----------------------------------------------------
 print("\n7. Подтверждение")
 
-confirmed = schedule.confirm_bookings(333)
+confirmed = schedule.confirm_bookings("vk",333)
 print(f"     подтверждено: {[(b['id'], b['status']) for b in confirmed]}")
 check("подтвердились те, о которых спрашивали",
       {b["id"] for b in confirmed} == {already, expire_soon, expire_late},
@@ -277,36 +277,36 @@ check("порядок по времени",
       [b["id"] for b in confirmed] == sorted(
           [b["id"] for b in confirmed],
           key=lambda i: schedule.booking_datetime(schedule.get_booking(i))))
-check("подтверждать второй раз нечего", schedule.confirm_bookings(333) == [])
+check("подтверждать второй раз нечего", schedule.confirm_bookings("vk",333) == [])
 
 
 # --- 8. Подписки ----------------------------------------------------------
 print("\n8. Подписки")
 
-subscription = schedule.add_subscription(CLIENT, DAY2, 90, "cold", "short",
+subscription = schedule.add_subscription("vk",CLIENT, DAY2, 90, "cold", "short",
                                          "thin", 2100, 2400)
 print(f"     {subscription}")
 check("подписка создалась", subscription is not None)
 check("параметры процедуры сохранены",
       schedule.day_subscribers(DAY2)[0] == subscription, str(subscription))
 check("повторная на тот же день не создаётся",
-      schedule.add_subscription(CLIENT, DAY2, 120, "botox", "short", "thin",
+      schedule.add_subscription("vk",CLIENT, DAY2, 120, "botox", "short", "thin",
                                 2500, 2900) is None)
 check("дубль не появился в базе",
       len(db.query("SELECT * FROM subscriptions")) == 1)
 check("первая подписка не переписана",
       schedule.day_subscribers(DAY2)[0]["service"] == "cold")
-check("клиент подписан", schedule.is_subscribed(CLIENT, DAY2) is True)
-check("на другой день не подписан", schedule.is_subscribed(CLIENT, DAY) is False)
-check("другой клиент не подписан", schedule.is_subscribed(OTHER, DAY2) is False)
+check("клиент подписан", schedule.is_subscribed("vk",CLIENT, DAY2) is True)
+check("на другой день не подписан", schedule.is_subscribed("vk",CLIENT, DAY) is False)
+check("другой клиент не подписан", schedule.is_subscribed("vk",OTHER, DAY2) is False)
 
 # Другой клиент на тот же день — это другая подписка, ключ не мешает.
 check("другой клиент на тот же день — можно",
-      schedule.add_subscription(OTHER, DAY2, 90, "cold", "short", "thin",
+      schedule.add_subscription("vk",OTHER, DAY2, 90, "cold", "short", "thin",
                                 2100, 2400) is not None)
 check("день видит обоих", len(schedule.day_subscribers(DAY2)) == 2)
 check("клиенту видна только своя",
-      len(schedule.user_subscriptions(CLIENT)) == 1)
+      len(schedule.user_subscriptions("vk",CLIENT)) == 1)
 
 # Лимит: MAX_SUBSCRIPTIONS дней и ни одним больше. Одна подписка у клиента
 # уже есть, поэтому добираем на единицу меньше лимита.
@@ -314,25 +314,25 @@ free_days = work_days_ahead(config.MAX_SUBSCRIPTIONS, 9)
 
 for day in free_days[:config.MAX_SUBSCRIPTIONS - 1]:
     check(f"подписка на {day} создалась",
-          schedule.add_subscription(CLIENT, day, 90, "cold", "short", "thin",
+          schedule.add_subscription("vk",CLIENT, day, 90, "cold", "short", "thin",
                                     2100, 2400) is not None)
 
 check("лимит набран",
-      schedule.subscriptions_count(CLIENT) == config.MAX_SUBSCRIPTIONS,
-      str(schedule.user_subscriptions(CLIENT)))
+      schedule.subscriptions_count("vk",CLIENT) == config.MAX_SUBSCRIPTIONS,
+      str(schedule.user_subscriptions("vk",CLIENT)))
 check("сверх лимита не подписаться",
-      schedule.add_subscription(CLIENT, free_days[-1], 90, "cold", "short",
+      schedule.add_subscription("vk",CLIENT, free_days[-1], 90, "cold", "short",
                                 "thin", 2100, 2400) is None)
 check("лишняя подписка в базу не попала",
-      schedule.is_subscribed(CLIENT, free_days[-1]) is False)
+      schedule.is_subscribed("vk",CLIENT, free_days[-1]) is False)
 check("лимит виден снаружи",
-      schedule.subscriptions_limit_reached(CLIENT) is True)
+      schedule.subscriptions_limit_reached("vk",CLIENT) is True)
 check("у другого клиента свой лимит",
-      schedule.subscriptions_limit_reached(OTHER) is False)
+      schedule.subscriptions_limit_reached("vk",OTHER) is False)
 
 check("список по возрастанию даты",
-      [s["date"] for s in schedule.user_subscriptions(CLIENT)]
-      == sorted(s["date"] for s in schedule.user_subscriptions(CLIENT)))
+      [s["date"] for s in schedule.user_subscriptions("vk",CLIENT)]
+      == sorted(s["date"] for s in schedule.user_subscriptions("vk",CLIENT)))
 
 # Прошедшая подписка: в выдаче её нет, в базе до уборки лежит.
 db.execute(
@@ -341,18 +341,18 @@ db.execute(
     (OTHER, (date.today() - timedelta(days=1)).isoformat(), 90, "cold",
      "short", "thin", 2100, 2400))
 check("вчерашняя подписка не в списке",
-      len(schedule.user_subscriptions(OTHER)) == 1)
-check("и в лимит не идёт", schedule.subscriptions_count(OTHER) == 1)
+      len(schedule.user_subscriptions("vk",OTHER)) == 1)
+check("и в лимит не идёт", schedule.subscriptions_count("vk",OTHER) == 1)
 check("уборка её убирает", db.cleanup() == 1)
 
-check("подписка снимается", schedule.remove_subscription(CLIENT, DAY2) is True)
+check("подписка снимается", schedule.remove_subscription("vk",CLIENT, DAY2) is True)
 check("снимать дважды нечего",
-      schedule.remove_subscription(CLIENT, DAY2) is False)
+      schedule.remove_subscription("vk",CLIENT, DAY2) is False)
 check("после снятия можно подписаться заново",
-      schedule.add_subscription(CLIENT, DAY2, 90, "cold", "short", "thin",
+      schedule.add_subscription("vk",CLIENT, DAY2, 90, "cold", "short", "thin",
                                 2100, 2400) is not None)
 check("подписки клиента остались в базе",
-      schedule.subscriptions_count(CLIENT) == config.MAX_SUBSCRIPTIONS)
+      schedule.subscriptions_count("vk",CLIENT) == config.MAX_SUBSCRIPTIONS)
 
 
 # --- 9. Перенос записи ----------------------------------------------------
@@ -361,7 +361,7 @@ print("\n9. Перенос записи")
 MOVER = 900
 MOVE_DAY, OTHER_DAY = work_days_ahead(2, min_shift=7)
 
-moved = schedule.create_booking(MOVER, MOVE_DAY, "10:00", 90, "cold",
+moved = schedule.create_booking("vk",MOVER, MOVE_DAY, "10:00", 90, "cold",
                                 "short", "thin", 2100, 2400)
 
 check("своё время занято для чужих",
@@ -374,28 +374,28 @@ check("without() убирает ровно одну запись",
 check("without(None) не меняет список",
       schedule.without([{"id": 1}], None) == [{"id": 1}])
 
-fresh = schedule.move_booking(moved["id"], MOVER, OTHER_DAY, "12:00", 90,
+fresh = schedule.move_booking(moved["id"], "vk",MOVER, OTHER_DAY, "12:00", 90,
                               "cold", "short", "thin", 2100, 2400)
 check("перенос состоялся", fresh is not None)
 check("у новой записи свой номер", fresh and fresh["id"] != moved["id"])
 check("старая помечена MOVED",
       schedule.get_booking(moved["id"])["status"] == "MOVED")
 check("MOVED время не занимает", "10:00" in schedule.free_slots(MOVE_DAY, 90))
-check("активная запись одна", schedule.active_count(MOVER) == 1)
+check("активная запись одна", schedule.active_count("vk",MOVER) == 1)
 
 check("дважды перенести ту же запись нельзя",
-      schedule.move_booking(moved["id"], MOVER, MOVE_DAY, "10:00", 90, "cold",
+      schedule.move_booking(moved["id"], "vk",MOVER, MOVE_DAY, "10:00", 90, "cold",
                             "short", "thin", 2100, 2400) is None)
 check("чужую запись перенести нельзя",
-      schedule.move_booking(fresh["id"], MOVER + 1, MOVE_DAY, "10:00", 90,
+      schedule.move_booking(fresh["id"], "vk",MOVER + 1, MOVE_DAY, "10:00", 90,
                             "cold", "short", "thin", 2100, 2400) is None)
 check("за конец рабочего дня не переносит",
-      schedule.move_booking(fresh["id"], MOVER, OTHER_DAY, "19:30", 90,
+      schedule.move_booking(fresh["id"], "vk",MOVER, OTHER_DAY, "19:30", 90,
                             "cold", "short", "thin", 2100, 2400) is None)
 check("после неудачи запись осталась активной",
       schedule.get_booking(fresh["id"])["status"] in schedule.ACTIVE_STATUSES)
 
-inside = schedule.move_booking(fresh["id"], MOVER, OTHER_DAY, "12:30", 90,
+inside = schedule.move_booking(fresh["id"], "vk",MOVER, OTHER_DAY, "12:30", 90,
                                "cold", "short", "thin", 2100, 2400)
 check("перенос внутри дня на соседнее время", inside is not None)
 check("и он действительно сдвинул", inside and inside["start"] == "12:30")
@@ -493,7 +493,7 @@ check("отрезок посчитан в минутах",
       schedule.closed_intervals(CLOSED_DAY) == [(720, 900)],
       str(schedule.closed_intervals(CLOSED_DAY)))
 
-inside = schedule.create_booking(CLIENT + 7, CLOSED_DAY, "10:00", 90, "cold",
+inside = schedule.create_booking("vk",CLIENT + 7, CLOSED_DAY, "10:00", 90, "cold",
                                  "short", "thin", 2100, 2400)
 caught = schedule.bookings_in_closure(CLOSED_DAY, CLOSED_DAY, "12:00", "15:00")
 check("запись до отлучки под неё не попала",
@@ -513,7 +513,7 @@ check("второй раз отменять нечего",
 
 schedule.remove_closure(part["id"])
 
-single = schedule.create_booking(CLIENT + 8, FREE_DAY, "10:00", 90, "cold",
+single = schedule.create_booking("vk",CLIENT + 8, FREE_DAY, "10:00", 90, "cold",
                                  "short", "thin", 2100, 2400)
 done = schedule.cancel_by_master(single["id"], "Перенесли салон")
 check("одиночная отмена сработала", done is not None)
