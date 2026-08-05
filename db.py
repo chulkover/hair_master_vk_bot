@@ -38,12 +38,14 @@ DB_FILE = config.DB_FILE
 #   4 — одна база на несколько мессенджеров: у диалогов, записей и подписок
 #       появилась колонка platform («vk», «tg»), и человек опознаётся парой
 #       (platform, user_id). Номера у ВК и Telegram свои и могут совпасть,
-#       поэтому одного user_id для этого уже мало.
+#       поэтому одного user_id для этого уже мало;
+#   5 — связка аккаунтов: contacts (кто вообще писал боту и как его найти)
+#       и links (заявки и подтверждённые связи ВК ↔ Telegram).
 #
 # Механизма миграций в проекте нет: данные учебные, и базу проще удалить.
 # Но проверка версии при старте есть — см. connect(): база от старой версии
 # не должна молча приехать в новый код.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 # =========================================================================
@@ -142,6 +144,47 @@ CREATE TABLE IF NOT EXISTS closures (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- Все, кто когда-либо писал боту, и то, по чему их можно найти.
+--
+-- Нужна ради связки аккаунтов. Человек присылает «@d_chul» или
+-- «vk.com/chuul» — а по такому имени номер аккаунта взять неоткуда:
+-- в Telegram по @username чужой id не узнать в принципе, там нет
+-- такого метода. Зато имя и @username лежат в каждом входящем
+-- сообщении. Поэтому запоминаем их на каждом сообщении: эта таблица
+-- и есть ответ на вопрос «а писал ли нам такой человек».
+--
+-- Отсюда же берётся проверка «сообщение от пользователя не найдено»:
+-- нет строки — значит человек боту не писал, и связывать не с чем.
+CREATE TABLE IF NOT EXISTS contacts (
+    platform  TEXT    NOT NULL,          -- vk, tg
+    user_id   INTEGER NOT NULL,          -- номер в этом мессенджере
+    name      TEXT    NOT NULL DEFAULT '',  -- «Мария Петрова», для показа
+    handle    TEXT    NOT NULL DEFAULT '',  -- username в TG, домен в ВК, без @
+    seen_date TEXT    NOT NULL,          -- когда писал в последний раз
+    PRIMARY KEY (platform, user_id)
+) WITHOUT ROWID;
+
+-- Связки аккаунтов: заявка ждёт ответа (PENDING) или связь подтверждена
+-- (CONFIRMED). Одна строка на пару.
+--
+-- a — кто попросил связать, b — кого спросили. Порядок важен только
+-- пока заявка висит: подтверждать её должен именно b, а сообщение
+-- «вас хотят связать» видит тоже он. После подтверждения стороны
+-- равны, и связь ищется в обе стороны — см. linked_identities().
+--
+-- Записи, подписки и диалоги эта таблица не трогает: они как лежали
+-- со своими platform и user_id, так и лежат. Связка лишь добавляет
+-- к вопросу «чьё это» второй аккаунт, поэтому отвязка ничего не портит.
+CREATE TABLE IF NOT EXISTS links (
+    a_platform   TEXT    NOT NULL,
+    a_id         INTEGER NOT NULL,
+    b_platform   TEXT    NOT NULL,
+    b_id         INTEGER NOT NULL,
+    status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'CONFIRMED')),
+    created_date TEXT    NOT NULL,       -- по нему протухает заявка
+    PRIMARY KEY (a_platform, a_id, b_platform, b_id)
 ) WITHOUT ROWID;
 """
 
@@ -408,6 +451,157 @@ def set_setting(key, value):
 
 
 # =========================================================================
+# 4б. Кто нам писал и связка аккаунтов
+# =========================================================================
+# Человек с одним и тем же телефоном может прийти и из ВК, и из Telegram.
+# Для бота это два разных клиента: пары (platform, user_id) у них разные,
+# и записи у каждого свои. Связка аккаунтов позволяет ему сказать «это тоже
+# я» — и увидеть свои записи из любого мессенджера.
+#
+# Сами записи при этом не переписываются: связка добавляется рядом, отдельной
+# строкой. Поэтому отвязка ничего не ломает — всё просто разъезжается обратно.
+
+def save_contact(platform, user_id, name, handle):
+    """Запомнить, что этот человек нам писал, и чем его можно найти.
+
+    Зовётся на каждом входящем сообщении. Строка одна на человека
+    и просто обновляется — история переписки нам не нужна, нужен ответ
+    на вопрос «писал ли он вообще и какой у него номер».
+
+    Пустое имя или handle прежнее значение НЕ затирают: узнать имя не всегда
+    удаётся (ВК может не ответить, в Telegram человек мог убрать @username),
+    и терять из-за этого то, что уже знаем, незачем.
+    """
+    execute(
+        "INSERT INTO contacts (platform, user_id, name, handle, seen_date) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT (platform, user_id) DO UPDATE SET "
+        "    name   = CASE WHEN excluded.name   != '' "
+        "                  THEN excluded.name   ELSE name   END, "
+        "    handle = CASE WHEN excluded.handle != '' "
+        "                  THEN excluded.handle ELSE handle END, "
+        "    seen_date = excluded.seen_date",
+        (platform, user_id, name or "", handle or "", date.today().isoformat()),
+    )
+
+
+def get_contact(platform, user_id):
+    """Что мы знаем об этом человеке, или None, если он боту не писал."""
+    return query_one(
+        "SELECT * FROM contacts WHERE platform = ? AND user_id = ?",
+        (platform, user_id),
+    )
+
+
+def find_contact(platform, handle):
+    """Найти человека в этом мессенджере по имени вида «d_chul». Или None.
+
+    Ради этого таблица и заведена: по @username или домену ВК спросить номер
+    аккаунта у самого мессенджера нельзя, а у себя — можно, если запоминали.
+
+    Регистр не важен: человек напишет «@D_Chul», а сохранено «d_chul».
+    lower() в SQLite умеет только латиницу, но имена аккаунтов латиницей
+    и пишутся — кириллицы в них не бывает.
+    """
+    if not handle:
+        return None
+    return query_one(
+        "SELECT * FROM contacts "
+        "WHERE platform = ? AND handle != '' AND lower(handle) = lower(?)",
+        (platform, handle),
+    )
+
+
+def linked_identities(platform, user_id):
+    """Все аккаунты этого человека: он сам плюс связанный, если связь есть.
+
+    Возвращает список пар [(platform, user_id), ...] — всегда хотя бы одну,
+    саму себя. Поэтому вызывающему коду не нужно разбирать случай «связи нет»:
+    он получит список из одного элемента, и запрос выйдет ровно такой же,
+    какой был до всякой связки.
+
+    Ищем в обе стороны: кто кого попросил, после подтверждения уже неважно.
+    """
+    rows = query(
+        "SELECT a_platform, a_id, b_platform, b_id FROM links "
+        "WHERE status = 'CONFIRMED' "
+        "  AND ((a_platform = ? AND a_id = ?) OR (b_platform = ? AND b_id = ?))",
+        (platform, user_id, platform, user_id),
+    )
+
+    identities = [(platform, user_id)]
+    for row in rows:
+        for side in (("a_platform", "a_id"), ("b_platform", "b_id")):
+            pair = (row[side[0]], row[side[1]])
+            if pair != (platform, user_id):
+                identities.append(pair)
+    return identities
+
+
+def link_for(platform, user_id):
+    """Связка с участием этого человека — заявка или готовая. Или None.
+
+    Одна связка на аккаунт: пока висит заявка или есть подтверждённая пара,
+    вторую заводить нельзя. Иначе пришлось бы разбирать, кто с кем и через
+    кого связан, — а для «у меня ВК и Telegram» это лишнее.
+    """
+    return query_one(
+        "SELECT * FROM links "
+        "WHERE (a_platform = ? AND a_id = ?) OR (b_platform = ? AND b_id = ?)",
+        (platform, user_id, platform, user_id),
+    )
+
+
+def pending_for(platform, user_id):
+    """Заявка, которую ждут именно от этого человека. Или None.
+
+    Только сторона b: подтверждает тот, кого спросили, а не тот, кто попросил.
+    """
+    return query_one(
+        "SELECT * FROM links "
+        "WHERE b_platform = ? AND b_id = ? AND status = 'PENDING'",
+        (platform, user_id),
+    )
+
+
+def add_link_request(a_platform, a_id, b_platform, b_id):
+    """Завести заявку «a хочет связать с собой b». Ждёт подтверждения b."""
+    execute(
+        "INSERT OR REPLACE INTO links "
+        "(a_platform, a_id, b_platform, b_id, status, created_date) "
+        "VALUES (?, ?, ?, ?, 'PENDING', ?)",
+        (a_platform, a_id, b_platform, b_id, date.today().isoformat()),
+    )
+
+
+def confirm_link(a_platform, a_id, b_platform, b_id):
+    """Подтвердить заявку. True — если было что подтверждать.
+
+    Статус в условии не для красоты: подтвердить можно только висящую заявку.
+    Нажатие «Да» вторым разом уже ничего не меняет и вернёт False.
+    """
+    return execute(
+        "UPDATE links SET status = 'CONFIRMED' "
+        "WHERE a_platform = ? AND a_id = ? AND b_platform = ? AND b_id = ? "
+        "  AND status = 'PENDING'",
+        (a_platform, a_id, b_platform, b_id),
+    ) > 0
+
+
+def drop_links(platform, user_id):
+    """Убрать связку этого человека — отказ от заявки или отвязка. Сколько убрали.
+
+    Одной функцией, потому что для базы это одно и то же: строки больше нет.
+    Записи и подписки остаются на своих аккаунтах — их связка не трогала.
+    """
+    return execute(
+        "DELETE FROM links "
+        "WHERE (a_platform = ? AND a_id = ?) OR (b_platform = ? AND b_id = ?)",
+        (platform, user_id, platform, user_id),
+    )
+
+
+# =========================================================================
 # 5. Уборка
 # =========================================================================
 
@@ -422,10 +616,16 @@ def cleanup():
     Подписки живут до конца своего дня, а диалоги — пока клиент не пропал
     на KEEP_DIALOG_DAYS: незаконченный выбор времени месячной давности
     возвращать смысла нет, клиент всё равно начнёт с меню.
+
+    Из связок убираются только заявки, на которые не ответили: подтверждённая
+    связка живёт, пока человек сам её не снимет. Контакты не трогаем вовсе —
+    строка на человека весит десятки байт, а без неё перестанет находиться
+    тот, кто писал боту давно, и связать аккаунты станет нельзя.
     """
     today = date.today()
     old_bookings = today - timedelta(days=config.KEEP_HISTORY_DAYS)
     old_dialogs = today - timedelta(days=config.KEEP_DIALOG_DAYS)
+    old_requests = today - timedelta(days=config.KEEP_LINK_REQUEST_DAYS)
 
     removed = execute("DELETE FROM bookings WHERE date < ?",
                       (old_bookings.isoformat(),))
@@ -433,6 +633,9 @@ def cleanup():
                        (today.isoformat(),))
     removed += execute("DELETE FROM dialogs WHERE seen_date < ?",
                        (old_dialogs.isoformat(),))
+    removed += execute("DELETE FROM links WHERE status = 'PENDING' "
+                       "AND created_date < ?",
+                       (old_requests.isoformat(),))
 
     if removed:
         # Освободившиеся страницы возвращаем системе. Без этого файл базы

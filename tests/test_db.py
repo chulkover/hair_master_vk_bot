@@ -63,8 +63,8 @@ check("файл базы создан", TEST_DB.exists())
 tables = {row["name"] for row in
           db.query("SELECT name FROM sqlite_master WHERE type = 'table'")}
 check("таблицы на месте",
-      {"bookings", "subscriptions", "dialogs", "closures", "settings"}
-      <= tables, str(sorted(tables)))
+      {"bookings", "subscriptions", "dialogs", "closures", "settings",
+       "contacts", "links"} <= tables, str(sorted(tables)))
 
 indexes = db.query("SELECT name, tbl_name FROM sqlite_master "
                    "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'")
@@ -315,8 +315,96 @@ check("свежая подписка на месте",
 check("уборка на убранной базе ничего не удаляет", db.cleanup() == 0)
 
 
-# --- 9. Версия схемы ------------------------------------------------------
-print("\n9. Версия схемы")
+# --- 9. Контакты и связка аккаунтов ---------------------------------------
+print("\n9. Контакты и связка аккаунтов")
+
+# Контакты: по ним потом ищут человека в другом мессенджере.
+check("незнакомый контакт -> None", db.get_contact("tg", 777) is None)
+
+db.save_contact("tg", 777, "Мария Петрова", "d_chul")
+saved = db.get_contact("tg", 777)
+check("контакт сохранился", saved is not None)
+check("имя на месте", saved and saved["name"] == "Мария Петрова")
+check("handle на месте", saved and saved["handle"] == "d_chul")
+
+check("поиск по handle находит",
+      (db.find_contact("tg", "d_chul") or {}).get("user_id") == 777)
+check("регистр в handle не важен",
+      (db.find_contact("tg", "D_Chul") or {}).get("user_id") == 777)
+check("в другом мессенджере тот же handle не находится",
+      db.find_contact("vk", "d_chul") is None)
+check("пустой handle ничего не находит", db.find_contact("tg", "") is None)
+
+# Имя узнаётся не всегда: ВК может не ответить, @username человек мог убрать.
+# Пустое значение не должно стирать то, что мы уже знаем.
+db.save_contact("tg", 777, "", "")
+kept = db.get_contact("tg", 777)
+check("пустое имя не затирает прежнее", kept["name"] == "Мария Петрова")
+check("пустой handle не затирает прежний", kept["handle"] == "d_chul")
+
+db.save_contact("tg", 777, "Мария Иванова", "masha")
+renamed = db.get_contact("tg", 777)
+check("непустое имя обновляется", renamed["name"] == "Мария Иванова")
+check("непустой handle обновляется", renamed["handle"] == "masha")
+
+# Связка. Главное свойство: пока её нет, всё работает ровно как раньше —
+# список личностей состоит из одного человека, и запросы не меняются.
+db.save_contact("vk", 12345, "Мария Петрова", "chuul")
+
+alone = db.linked_identities("vk", 12345)
+check("без связки личность одна", alone == [("vk", 12345)], str(alone))
+check("без связки link_for -> None", db.link_for("vk", 12345) is None)
+
+db.add_link_request("vk", 12345, "tg", 777)
+check("заявку ждут от того, кого спросили",
+      (db.pending_for("tg", 777) or {}).get("a_id") == 12345)
+check("от того, кто попросил, заявку не ждут",
+      db.pending_for("vk", 12345) is None)
+check("заявка видна обеим сторонам", db.link_for("vk", 12345) is not None
+      and db.link_for("tg", 777) is not None)
+check("пока заявка не подтверждена, личность одна",
+      db.linked_identities("vk", 12345) == [("vk", 12345)])
+
+check("подтверждение сработало",
+      db.confirm_link("vk", 12345, "tg", 777) is True)
+check("второй раз подтверждать нечего",
+      db.confirm_link("vk", 12345, "tg", 777) is False)
+check("подтверждённой заявки больше не ждут",
+      db.pending_for("tg", 777) is None)
+
+both_vk = db.linked_identities("vk", 12345)
+both_tg = db.linked_identities("tg", 777)
+print(f"     после связки: {both_vk}")
+check("из ВК видно оба аккаунта, свой первым",
+      both_vk == [("vk", 12345), ("tg", 777)], str(both_vk))
+check("из Telegram видно оба, свой первым",
+      both_tg == [("tg", 777), ("vk", 12345)], str(both_tg))
+check("посторонний человек связки не видит",
+      db.linked_identities("vk", 999) == [("vk", 999)])
+
+check("отвязка убрала строку", db.drop_links("tg", 777) == 1)
+check("после отвязки личность снова одна",
+      db.linked_identities("vk", 12345) == [("vk", 12345)])
+check("контакты отвязка не трогает", db.get_contact("tg", 777) is not None)
+
+# Заявка, на которую не ответили, не должна висеть вечно. Подтверждённая
+# связка живёт, пока человек сам её не снимет.
+db.add_link_request("vk", 12345, "tg", 777)
+db.execute("UPDATE links SET created_date = ?",
+           ((TODAY - timedelta(days=config.KEEP_LINK_REQUEST_DAYS + 1))
+            .isoformat(),))
+db.add_link_request("vk", 555, "tg", 556)
+db.confirm_link("vk", 555, "tg", 556)
+
+check("уборка сняла просроченную заявку", db.cleanup() == 1)
+check("просроченной заявки нет", db.link_for("tg", 777) is None)
+check("подтверждённая связка уборку пережила",
+      db.link_for("vk", 555) is not None)
+db.drop_links("vk", 555)
+
+
+# --- 10. Версия схемы -----------------------------------------------------
+print("\n10. Версия схемы")
 
 # База от прошлой версии не должна молча приехать в новый код: CREATE TABLE
 # IF NOT EXISTS увидит таблицы с нужными именами и уйдёт, новых колонок
@@ -354,7 +442,7 @@ check("своя база после этого открывается",
 
 
 # --- 10. сколько занимает -------------------------------------------------
-print("\n10. Размер")
+print("\n11. Размер")
 
 rows = db.query_one("SELECT count(*) AS n FROM bookings")["n"]
 db.close()
