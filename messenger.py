@@ -303,15 +303,24 @@ class TgMessenger(Messenger):
         self._names[sender["id"]] = (name, sender.get("username", ""))
 
     def listen(self):
+        # getUpdates и webhook у Telegram взаимоисключающие: если на боте когда-то
+        # включали webhook, getUpdates отвечает 409, пока его не снять. Снимаем
+        # один раз — как только до Telegram впервые достучались (флаг ниже), —
+        # и дальше спокойно опрашиваем. deleteWebhook безвреден, даже если
+        # webhook'а и не было.
+        webhook_cleared = False
         while True:
             try:
+                if not webhook_cleared:
+                    self._call("deleteWebhook", {})
+                    webhook_cleared = True
                 updates = self._call(
                     "getUpdates",
                     {"offset": self._offset, "timeout": self.POLL_SECONDS},
                     timeout=self.POLL_TIMEOUT,
                 )
             except MessengerError as error:
-                # Обрыв связи не должен ронять бота: подождём и спросим снова.
+                # Обрыв связи или отказ не должны ронять бота: ждём и снова.
                 print(f"Telegram: {error}; повтор через 5 c")
                 time.sleep(5)
                 continue
@@ -423,23 +432,33 @@ def create():
     """Собрать бота с мессенджерами, выбранными для этого запуска.
 
     Какие включены — решается здесь, в одном месте, по настройке `platform`
-    в разделе [bot] файла config.cfg. Сейчас мессенджер один, ВКонтакте, и он
-    же стоит по умолчанию: раздела в настройках может не быть вовсе, старые
+    в разделе [bot] файла config.cfg. Значений может быть несколько через
+    запятую: `platform = vk, tg` поднимет оба канала на одной базе. ВКонтакте
+    стоит по умолчанию: раздела в настройках может не быть вовсе, старые
     установки от этого не сломаются.
 
-    Ключ доступа каждый мессенджер берёт свой: у ВК это config.VK_TOKEN.
-    Появится Telegram — здесь добавится ещё один мессенджер в словарь со своим
-    токеном, и это единственное место, которого коснётся правка. main.py
-    обращается к клиентам по платформе и не изменится.
+    Ключ доступа каждый мессенджер берёт свой и только когда включён: у ВК это
+    config.VK_TOKEN, у Telegram — config.read_tg_token(). Поэтому чисто ВК-
+    установке TG-ключ не нужен — за него мы даже не заглядываем. Это
+    единственное место, где решается, «на чём» работает бот; main.py обращается
+    к клиентам по платформе и от набора каналов не зависит.
     """
-    platform = "vk"
+    platforms = ["vk"]
     if config.SETTINGS.has_option("bot", "platform"):
-        platform = config.SETTINGS.get("bot", "platform").strip().lower() or "vk"
+        raw = config.SETTINGS.get("bot", "platform")
+        platforms = [p.strip().lower() for p in raw.split(",") if p.strip()] or ["vk"]
 
-    if platform == "vk":
-        return Bot({"vk": VkMessenger("vk", config.VK_TOKEN)})
-
-    raise SystemExit(
-        f"В настройках [bot] platform указан неизвестный мессенджер "
-        f"«{platform}». Сейчас поддерживается только vk."
-    )
+    messengers = {}
+    for platform in platforms:
+        if platform in messengers:
+            continue  # повтор в настройке (vk, vk) — не беда, просто пропускаем
+        if platform == "vk":
+            messengers["vk"] = VkMessenger("vk", config.VK_TOKEN)
+        elif platform == "tg":
+            messengers["tg"] = TgMessenger("tg", config.read_tg_token())
+        else:
+            raise SystemExit(
+                f"В настройках [bot] platform указан неизвестный мессенджер "
+                f"«{platform}». Поддерживаются: vk, tg."
+            )
+    return Bot(messengers)
