@@ -78,16 +78,14 @@ class Messenger:
     метод обнаружится сразу и громко, а не превратится в молчащего бота.
     """
 
-    def send(self, user_id, text, keyboard=None):
-        """Отправить пользователю сообщение, при желании — с клавиатурой."""
-        raise NotImplementedError
+    def send(self, user_id, text, rows=None):
+        """Отправить пользователю сообщение, при желании — с клавиатурой.
 
-    def keyboard(self, rows):
-        """Превратить ряды подписей в клавиатуру, понятную мессенджеру.
-
-        rows — список рядов кнопок: [["Кератин"], ["Ботокс"], ["В меню"]].
-        Что вернётся, знает только мессенджер; боту это значение нужно лишь
-        затем, чтобы передать его обратно в send().
+        rows — ряды подписей кнопок ([["Кератин"], ["В меню"]]) или None.
+        В формат конкретного мессенджера (у ВК — VkKeyboard, у Telegram будет
+        своё) их превращает сам этот метод, уже в момент отправки. Диалог
+        передаёт одни и те же ряды, а каждый канал сериализует их по-своему —
+        поэтому одна и та же клавиатура годится и для ВК, и для Telegram.
         """
         raise NotImplementedError
 
@@ -134,14 +132,16 @@ class VkMessenger(Messenger):
         self._api = self._session.get_api()
         self._longpoll = VkLongPoll(self._session)
 
-    def send(self, user_id, text, keyboard=None):
+    def send(self, user_id, text, rows=None):
         params = {
             "user_id": user_id,
             "message": text,
             "random_id": 0,  # 0 = ВК сам не проверяет дубли, для учебного бота ок
         }
-        if keyboard is not None:
-            params["keyboard"] = keyboard
+        # Ряды кнопок превращаем в клавиатуру ВК здесь же, в момент отправки:
+        # диалог держит их «сырыми», чтобы те же ряды ушли и в другой канал.
+        if rows is not None:
+            params["keyboard"] = self._keyboard(rows)
         try:
             self._api.messages.send(**params)
         except ApiError as error:
@@ -158,7 +158,8 @@ class VkMessenger(Messenger):
                 )
             raise MessengerError(str(error), hint) from error
 
-    def keyboard(self, rows):
+    def _keyboard(self, rows):
+        """Ряды подписей -> клавиатура ВК (VkKeyboard JSON). Зовётся из send()."""
         # Не падаем, но громко жалуемся в консоль: молча потерянная кнопка —
         # это часы поисков «почему у клиента нет выхода в меню».
         if len(rows) > self.MAX_KEYBOARD_ROWS:
@@ -236,20 +237,14 @@ class Bot:
             )
         return messenger
 
-    def send(self, client, text, keyboard=None):
-        self.by(client.platform).send(client.id, text, keyboard)
+    def send(self, client, text, rows=None):
+        self.by(client.platform).send(client.id, text, rows)
 
     def user_name(self, client):
         return self.by(client.platform).user_name(client.id)
 
     def user_link(self, client):
         return self.by(client.platform).user_link(client.id)
-
-    def keyboard(self, rows, platform="vk"):
-        # Клавиатуру собирает конкретный мессенджер: у ВК это VkKeyboard.
-        # Пока канал один, платформа по умолчанию — vk; появится второй,
-        # клавиатуру нужно будет собирать под платформу получателя.
-        return self.by(platform).keyboard(rows)
 
     def listen(self):
         """Входящие сообщения всех включённых мессенджеров.
