@@ -20,6 +20,8 @@ main.py разговаривает с клиентом одними и теми 
 """
 
 import collections
+import queue
+import threading
 import time
 
 import requests
@@ -369,22 +371,48 @@ class Bot:
     def user_link(self, client):
         return self.by(client.platform).user_link(client.id)
 
-    def listen(self):
-        """Входящие сообщения всех включённых мессенджеров.
+    def _pump(self, channel, box):
+        """Слушать один канал и складывать входящие в общую очередь `box`.
 
-        Пока мессенджер один — просто отдаём его поток. Когда каналов станет
-        несколько, каждый надо будет слушать своим потоком и сводить в общую
-        очередь; входящая часть до этого места ещё дойдёт, а доставка (send)
-        по платформе уже готова.
+        Крутится в своём потоке — по одному на канал. Если listen() оборвётся
+        (сбой сети, ошибка библиотеки), не роняем весь бот и не гасим канал
+        молча: жалуемся в консоль, ждём и слушаем заново. Иначе один упавший
+        канал незаметно перестал бы принимать сообщения.
+        """
+        while True:
+            try:
+                for message in channel.listen():
+                    box.put(message)
+            except Exception as error:
+                print(f"канал «{channel.platform}» оборвался: {error}; "
+                      f"повтор через 5 c")
+                time.sleep(5)
+
+    def listen(self):
+        """Входящие сообщения всех включённых мессенджеров, одной лентой.
+
+        Один канал — просто отдаём его поток, без лишних потоков и очередей.
+
+        Несколько — каждый слушаем в своём потоке (у каждого свой блокирующий
+        приём: ВК ждёт longpoll, TG висит на getUpdates, и один не должен
+        задерживать другой). Все они складывают входящие в общую очередь, а
+        отсюда мы выдаём их по одному. Приём получается параллельным, а разбор
+        — последовательным: за очередью один потребитель (главный цикл в
+        main.py), и два сообщения не полезут в базу и в состояние диалога разом.
         """
         if len(self._messengers) == 1:
             (only,) = self._messengers.values()
             yield from only.listen()
             return
-        raise NotImplementedError(
-            "Одновременное прослушивание нескольких мессенджеров ещё "
-            "не сделано — см. listen() в messenger.py."
-        )
+
+        box = queue.Queue()
+        for platform, channel in self._messengers.items():
+            threading.Thread(
+                target=self._pump, args=(channel, box),
+                name=f"listen-{platform}", daemon=True,
+            ).start()
+        while True:
+            yield box.get()
 
 
 # =========================================================================
