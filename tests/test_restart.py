@@ -580,8 +580,104 @@ check("без короткого имени домен как «idN»",
 vk_api.PEOPLE[CLIENT] = ("Мария", "Петрова")
 
 
-# --- 17. Живые данные -----------------------------------------------------
-print("\n17. Живые данные")
+# --- 17. Связка аккаунтов ВК и Telegram -----------------------------------
+print("\n17. Связка аккаунтов ВК и Telegram")
+
+
+class FakeTg:
+    """Telegram-канал, который никуда не ходит: копит отправленное.
+
+    Настоящий TgMessenger полез бы в сеть, а нам нужно проверить сам обмен:
+    запрос ушёл тому, кого назвали, и подтверждение связало аккаунты.
+    """
+    platform = "tg"
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, user_id, text, rows=None):
+        self.sent.append((user_id, text))
+
+    def contact(self, user_id):
+        return ("Мария Т", "d_chul")
+
+
+fake_tg = FakeTg()
+main.bot._messengers["tg"] = fake_tg
+TG = main.Client("tg", 777)
+
+db.execute("DELETE FROM links")
+db.save_contact("vk", CLIENT, "Мария Петрова", "chuul")
+db.save_contact("tg", 777, "Мария Т", "d_chul")
+
+msg(main.PROFILE_BUTTON)
+check("профиль открылся", state() == main.PROFILE)
+check("предлагает связать", main.LINK_BUTTON in vk_api.SENT[-1]["keyboard"])
+
+msg(main.LINK_BUTTON)
+check("бот ждёт ссылку", state() == main.LINK_HANDLE)
+check("предупредили, что нужно писать из обоих",
+      "Telegram" in vk_api.SENT[-1]["message"])
+
+# Человек, который боту не писал, не найдётся — и процесс прерывается.
+msg("@nobody")
+check("незнакомого не нашли",
+      "не найдено" in vk_api.SENT[-2]["message"], vk_api.SENT[-2]["message"])
+check("вернулись в профиль", state() == main.PROFILE)
+check("заявки не завели", db.link_for("vk", CLIENT) is None)
+
+# А знакомого — находим по ссылке t.me/…
+msg(main.LINK_BUTTON)
+msg("https://t.me/d_chul")
+check("заявка заведена", (db.link_for("vk", CLIENT) or {}).get("status")
+      == "PENDING")
+check("запрос ушёл в Telegram", len(fake_tg.sent) == 1)
+check("в запросе видно, кто просит",
+      "Мария Петрова" in fake_tg.sent[-1][1], fake_tg.sent[-1][1])
+check("до подтверждения аккаунты не связаны",
+      db.linked_identities("vk", CLIENT) == [("vk", CLIENT)])
+
+# Подтверждение приходит со стороны Telegram.
+main.handle_message(TG, main.LINK_YES)
+linked = db.linked_identities("vk", CLIENT)
+check("после «Да» аккаунты связаны", linked == [("vk", CLIENT), ("tg", 777)],
+      str(linked))
+check("инициатору сообщили",
+      "подтвердил связку" in vk_api.SENT[-1]["message"],
+      vk_api.SENT[-1]["message"])
+
+# Второй раз связать нельзя: одна связка на аккаунт.
+msg(main.PROFILE_BUTTON)
+check("в профиле видно связку", "связан" in vk_api.SENT[-1]["message"])
+check("теперь предлагают отвязать",
+      main.UNLINK_BUTTON in vk_api.SENT[-1]["keyboard"])
+
+msg(main.UNLINK_BUTTON)
+check("после отвязки личность одна",
+      db.linked_identities("vk", CLIENT) == [("vk", CLIENT)])
+check("второму аккаунту сообщили об отвязке",
+      "снята" in fake_tg.sent[-1][1])
+
+# Отказ: заявка исчезает, связки нет.
+msg(main.PROFILE_BUTTON)
+msg(main.LINK_BUTTON)
+msg("@d_chul")
+main.handle_message(TG, main.LINK_NO)
+check("после «Нет» связки нет",
+      db.linked_identities("vk", CLIENT) == [("vk", CLIENT)])
+check("и заявка убрана", db.link_for("vk", CLIENT) is None)
+
+check("разбор ссылок", [main.parse_handle(t) for t in
+                        ("@d_chul", "vk.com/chuul", "https://vk.ru/chuul/",
+                         "t.me/d_chul", "vk.com/id555")]
+      == ["d_chul", "chuul", "chuul", "d_chul", "id555"])
+
+del main.bot._messengers["tg"]
+db.execute("DELETE FROM links")
+
+
+# --- 18. Живые данные -----------------------------------------------------
+print("\n18. Живые данные")
 
 check("боевая база не тронута",
       (config.DB_FILE.stat().st_mtime if config.DB_FILE.exists() else None)

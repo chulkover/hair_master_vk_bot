@@ -147,6 +147,9 @@ MY_SUBS = "MY_SUBS"                        # список подписок и о
 SELECTING_SUB_DATE = "SELECTING_SUB_DATE"  # выбор дня для подписки
 SUB_CONFIRM = "SUB_CONFIRM"                # «подписать вас на 31.07?»
 
+PROFILE = "PROFILE"          # профиль: связка аккаунтов ВК и Telegram
+LINK_HANDLE = "LINK_HANDLE"  # ждём ссылку на аккаунт в другом мессенджере
+
 # --- шаги владельца -------------------------------------------------------
 # Их много, но устроены они одинаково: почти ничего не помнят между
 # сообщениями. Где выбор виден на самой кнопке (день, час, номер записи),
@@ -389,6 +392,21 @@ WORK_BUTTON = "График работы"
 # времени, и в одной переписке две разные «Назад» путали бы.
 TO_CABINET = "В кабинет"
 
+# --- Профиль и связка аккаунтов -------------------------------------------
+PROFILE_BUTTON = "Профиль"
+LINK_BUTTON = "Связать аккаунты"
+UNLINK_BUTTON = "Отвязать аккаунт"
+
+# Ответы на «вас хотят связать». «Да, это я» вместо простого «Да»: кнопка
+# приходит посреди любого шага, и по одному слову «Да» человек не вспомнит,
+# на что отвечает.
+LINK_YES = "Да, это я"
+LINK_NO = "Нет, это не я"
+
+# Как мессенджер называется в разговоре с человеком: «vk» в тексте выглядит
+# как ошибка, а «ВКонтакте» — как речь.
+PLATFORM_NAMES = {"vk": "ВКонтакте", "tg": "Telegram"}
+
 # Возврат к списку дней с экрана одного дня.
 OTHER_SCHEDULE_DAY = "Другой день"
 
@@ -454,6 +472,8 @@ def menu_keyboard(user_id):
         sections.append(my_subs_button(user_id))
     if sections:
         rows.append(sections)
+
+    rows.append([PROFILE_BUTTON])
 
     # Владельцу — вход в кабинет. Кнопка есть только здесь, в главном меню,
     # и только у него: на других экранах она не появляется даже у владельца.
@@ -2492,6 +2512,181 @@ def run_scheduler():
 # 11. Главный обработчик сообщений
 # =========================================================================
 
+def other_platform(platform):
+    """Мессенджер, с которым связываются. Пока их два — значит, «не этот»."""
+    return "tg" if platform == "vk" else "vk"
+
+
+def parse_handle(text):
+    """Из того, что прислал человек, вытащить короткое имя аккаунта.
+
+    Принимаем всё, чем люди называют свою страницу: «@d_chul», «d_chul»,
+    «t.me/d_chul», «https://vk.com/chuul», «vk.ru/chuul», «vk.com/id12345».
+    Просить «пришлите строго в таком формате» бессмысленно — пришлют как
+    привыкли, а бот должен понять.
+
+    Домен ВК «id12345» тоже проходит: в contacts он и лежит в таком виде
+    у страниц без короткого имени.
+    """
+    handle = text.strip()
+
+    for prefix in ("https://", "http://", "www.", "m."):
+        if handle.lower().startswith(prefix):
+            handle = handle[len(prefix):]
+
+    for host in ("vk.com/", "vk.ru/", "t.me/", "telegram.me/"):
+        if handle.lower().startswith(host):
+            handle = handle[len(host):]
+
+    # Хвост после имени («?w=...», «/photos») и собачку — отбрасываем.
+    return handle.split("?")[0].split("/")[0].lstrip("@").strip()
+
+
+def link_status(user_id):
+    """Строка о связке для профиля: с кем связан или что не связан."""
+    linked = db.linked_identities(user_id.platform, user_id.id)
+    for platform, number in linked[1:]:
+        contact = db.get_contact(platform, number) or {}
+        name = contact.get("name") or contact.get("handle") or number
+        return f"Аккаунт связан с {PLATFORM_NAMES[platform]}: {name}."
+
+    waiting = db.link_for(user_id.platform, user_id.id)
+    if waiting:
+        return "Запрос на связку отправлен и ждёт подтверждения."
+    return "Аккаунты не связаны."
+
+
+def show_profile(user_id):
+    """Профиль: что бот о вас знает и связка аккаунтов."""
+    user = get_user(user_id)
+    user["state"] = PROFILE
+
+    linked = len(db.linked_identities(user_id.platform, user_id.id)) > 1
+    rows = [[UNLINK_BUTTON] if linked else [LINK_BUTTON], [BACK_TO_MENU]]
+
+    send(user_id, f"Профиль.\n\n{link_status(user_id)}", build_keyboard(rows))
+
+
+def start_link(user_id):
+    """Попросить ссылку на аккаунт в другом мессенджере."""
+    other = other_platform(user_id.platform)
+
+    # Второй канал может быть просто не включён в config.cfg — тогда связывать
+    # не с чем, и честнее сказать это сразу, чем ждать имя и не найти его.
+    try:
+        bot.by(other)
+    except messenger.MessengerError:
+        send(user_id, f"{PLATFORM_NAMES[other]} у этого бота сейчас "
+                      f"не подключён — связывать не с чем.")
+        show_profile(user_id)
+        return
+
+    if db.link_for(user_id.platform, user_id.id):
+        send(user_id, "У этого аккаунта уже есть связка или запрос на неё. "
+                      "Сначала отвяжите текущий.")
+        show_profile(user_id)
+        return
+
+    get_user(user_id)["state"] = LINK_HANDLE
+    send(user_id,
+         f"Связка работает, только если вы уже писали этому боту и здесь, "
+         f"и в {PLATFORM_NAMES[other]}. Если оттуда сообщений не было — "
+         f"сначала напишите боту там, хотя бы «привет».\n\n"
+         f"Теперь пришлите ссылку на свой аккаунт в {PLATFORM_NAMES[other]} "
+         f"или его имя.",
+         build_keyboard([[BACK_TO_MENU]]))
+
+
+def do_link(user_id, text):
+    """Найти названный аккаунт и отправить ему запрос на подтверждение."""
+    other = other_platform(user_id.platform)
+    handle = parse_handle(text)
+    found = db.find_contact(other, handle)
+
+    # Главная проверка: человека, который боту не писал, мы не знаем даже
+    # по номеру — значит, и запрос ему не отправим. Прерываемся здесь.
+    if found is None:
+        send(user_id, f"К сожалению, сообщение от пользователя {handle} "
+                      f"не найдено.\n\n"
+                      f"Проверьте имя и убедитесь, что с того аккаунта "
+                      f"боту в {PLATFORM_NAMES[other]} уже писали.")
+        show_profile(user_id)
+        return
+
+    target = messenger.Client(other, found["user_id"])
+
+    if db.link_for(target.platform, target.id):
+        send(user_id, "Этот аккаунт уже связан с другим или ждёт ответа "
+                      "на такой же запрос.")
+        show_profile(user_id)
+        return
+
+    db.add_link_request(user_id.platform, user_id.id, target.platform, target.id)
+
+    # Кто просит: имя, а если его не узнали — короткое имя. Человек на той
+    # стороне должен понять, кому он открывает свои записи.
+    me = db.get_contact(user_id.platform, user_id.id) or {}
+    who = me.get("name") or me.get("handle") or user_id.id
+
+    bot.send(target,
+             f"Пользователь {who} желает связать с вами аккаунт "
+             f"{PLATFORM_NAMES[user_id.platform]}. Подтверждаем?\n\n"
+             f"После связки записи и подписки станут общими: их будет видно "
+             f"и здесь, и в {PLATFORM_NAMES[user_id.platform]}.",
+             build_keyboard([[LINK_YES], [LINK_NO]]))
+
+    name = found["name"] or handle
+    send(user_id, f"Запрос отправлен пользователю {name} "
+                  f"в {PLATFORM_NAMES[other]}. Ждём подтверждения.")
+    show_menu(user_id)
+
+
+def do_link_answer(user_id, agreed):
+    """Ответ на «вас хотят связать»: связываем или отказываем.
+
+    Кнопки живут в переписке вечно, и нажать их могут когда угодно — поэтому
+    заявку перечитываем из базы, а не полагаемся на состояние диалога.
+    """
+    request = db.pending_for(user_id.platform, user_id.id)
+    if request is None:
+        send(user_id, "Этот запрос уже неактуален.")
+        show_menu(user_id)
+        return
+
+    asker = messenger.Client(request["a_platform"], request["a_id"])
+    me = db.get_contact(user_id.platform, user_id.id) or {}
+    who = me.get("name") or me.get("handle") or user_id.id
+
+    if agreed:
+        db.confirm_link(asker.platform, asker.id,
+                        user_id.platform, user_id.id)
+        send(user_id, f"Готово: аккаунты связаны. Записи и подписки "
+                      f"из {PLATFORM_NAMES[asker.platform]} теперь видно здесь.")
+        send(asker, f"Пользователь {who} подтвердил связку. Записи и подписки "
+                    f"теперь общие.", menu_keyboard(asker))
+    else:
+        db.drop_links(user_id.platform, user_id.id)
+        send(user_id, "Хорошо, аккаунты не связаны.")
+        send(asker, f"Пользователь {who} отклонил связку аккаунтов.",
+             menu_keyboard(asker))
+
+    show_menu(user_id)
+
+
+def do_unlink(user_id):
+    """Разорвать связку. Записи остаются там, где были сделаны."""
+    linked = db.linked_identities(user_id.platform, user_id.id)
+    db.drop_links(user_id.platform, user_id.id)
+
+    for platform, number in linked[1:]:
+        other = messenger.Client(platform, number)
+        send(other, "Связка аккаунтов снята. Общими записи больше не будут.",
+             menu_keyboard(other))
+
+    send(user_id, "Связка снята. Ваши записи остались там, где вы их делали.")
+    show_menu(user_id)
+
+
 def handle_message(user_id, text):
     user = get_user(user_id)
     msg = text.strip().lower()
@@ -2507,6 +2702,13 @@ def handle_message(user_id, text):
 
     if msg == CONFIRM_COMING.lower():
         do_confirm(user_id)
+        return
+
+    # Ответ на «вас хотят связать» — тоже из любого состояния: запрос приходит
+    # посреди чужого шага, и заставлять человека сначала выйти в меню незачем.
+    # Заявку берём из базы, поэтому кнопка из старого сообщения не сломается.
+    if msg in (LINK_YES.lower(), LINK_NO.lower()):
+        do_link_answer(user_id, msg == LINK_YES.lower())
         return
 
     # Ровно == , а не startswith: иначе «Да, отменить запись» на экране
@@ -2540,6 +2742,8 @@ def handle_message(user_id, text):
         # состояния и разобрана выше.
         if msg == "узнать стоимость":
             ask_service(user_id)
+        elif msg == PROFILE_BUTTON.lower():
+            show_profile(user_id)
         elif msg == CABINET_BUTTON.lower() and is_owner(user_id):
             # Единственная дверь в кабинет. Здесь же и проверка владельца:
             # слово «кабинет», написанное клиентом, ничего не открывает.
@@ -2690,6 +2894,27 @@ def handle_message(user_id, text):
             # какую показать — обычную или «вы уже подписаны».
             send(user_id, "Выбери кнопку ниже:")
             ask_sub_confirm(user_id, user["sub_day"])
+        return
+
+    # --- профиль и связка аккаунтов ---
+    if state == PROFILE:
+        if msg == LINK_BUTTON.lower():
+            start_link(user_id)
+        elif msg == UNLINK_BUTTON.lower():
+            do_unlink(user_id)
+        else:
+            send(user_id, "Не понял. Выберите кнопку ниже:")
+            show_profile(user_id)
+        return
+
+    if state == LINK_HANDLE:
+        # Пустое сообщение до разбора: parse_handle из «@» сделает пустую
+        # строку, а искать по ней нечего.
+        if not parse_handle(text):
+            send(user_id, "Не похоже на ссылку или имя аккаунта. "
+                          "Пришлите, например, vk.com/chuul или @d_chul:")
+            return
+        do_link(user_id, text)
         return
 
     # --- список записей ---
