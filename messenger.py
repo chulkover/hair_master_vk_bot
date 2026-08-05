@@ -20,7 +20,9 @@ main.py разговаривает с клиентом одними и теми 
 """
 
 import collections
+import time
 
+import requests
 import vk_api
 from vk_api.exceptions import ApiError
 from vk_api.longpoll import VkLongPoll, VkEventType
@@ -201,6 +203,127 @@ class VkMessenger(Messenger):
         for event in self._longpoll.listen():
             if event.type == VkEventType.MESSAGE_NEW and event.to_me:
                 yield Incoming(Client(self.platform, event.user_id), event.text)
+
+
+# =========================================================================
+# TgMessenger: тот же интерфейс, но через Telegram
+# =========================================================================
+
+class TgMessenger(Messenger):
+    """Telegram: тот же набор действий, что и у ВК, но через Bot API по HTTP.
+
+    Никакой отдельной библиотеки: Telegram отвечает обычным JSON на запросы
+    к https://api.telegram.org/bot<токен>/<метод>, и `requests` для этого
+    достаточно. Весь HTTP спрятан в `_call()`, наружу торчат те же send/listen/
+    user_name/user_link, что и у VkMessenger, — bot.py разницы не замечает.
+
+    Две особенности Telegram, из-за которых код чуть отличается от ВК:
+
+      * входящие приходят не потоком событий, а ответом на запрос getUpdates
+        (long polling): спрашиваем «что нового с номера offset», в ответ пачка
+        обновлений, offset двигаем за последнее — иначе те же придут снова;
+      * узнать имя по чужому числовому id в Telegram нельзя (нет аналога
+        users.get). Зато имя и @username лежат в каждом входящем сообщении —
+        их и запоминаем в `_names`, чтобы потом показать мастеру.
+    """
+
+    API = "https://api.telegram.org/bot{token}/{method}"
+
+    # getUpdates держит соединение открытым до 25 секунд, ожидая сообщение
+    # (long polling): так бот узнаёт о новом почти мгновенно и не долбит сервер
+    # пустыми запросами. Таймаут самого HTTP-запроса берём с запасом сверх
+    # этого, чтобы рвал соединение Telegram, а не requests.
+    POLL_SECONDS = 25
+    POLL_TIMEOUT = POLL_SECONDS + 10
+
+    def __init__(self, platform, token):
+        self.platform = platform
+        self._token = token
+        self._offset = 0        # с какого обновления читать дальше
+        self._names = {}        # id -> (имя, username) из входящих сообщений
+
+    def _call(self, method, params, timeout=10):
+        """Дёрнуть метод Bot API и вернуть его result. Ошибку -> MessengerError.
+
+        Telegram на любой запрос отвечает JSON вида {"ok": ..., ...}. При ok=true
+        полезное лежит в "result"; при ok=false там "error_code"/"description".
+        Сетевую ошибку и отказ Telegram одинаково прячем за MessengerError —
+        чтобы их ловил код, ничего не знающий про requests и про Bot API.
+        """
+        url = self.API.format(token=self._token, method=method)
+        try:
+            data = requests.post(url, json=params, timeout=timeout).json()
+        except requests.RequestException as error:
+            raise MessengerError(f"Telegram недоступен: {error}") from error
+        if not data.get("ok"):
+            raise MessengerError(
+                f"Telegram отклонил {method}: "
+                f"{data.get('error_code')} {data.get('description')}"
+            )
+        return data["result"]
+
+    def send(self, user_id, text, rows=None):
+        params = {
+            "chat_id": user_id,
+            "text": text,
+            "reply_markup": self._keyboard(rows),
+        }
+        self._call("sendMessage", params)
+
+    def _keyboard(self, rows):
+        """Ряды подписей -> reply-клавиатура Telegram (reply_markup для send).
+
+        rows=None означает «убрать клавиатуру»: у Telegram она держится на экране,
+        пока её явно не снять (в ВК каждое сообщение несёт свою). Строки в рядах
+        Telegram принимает как есть — кнопкой становится сам текст, отдельный
+        объект на простую кнопку не нужен.
+        """
+        if rows is None:
+            return {"remove_keyboard": True}
+        return {"keyboard": rows, "resize_keyboard": True}
+
+    def user_name(self, user_id):
+        # Только из того, что человек сам прислал: имя запомнено при входящем
+        # сообщении. Не писал боту — имени нет, вернём пустую строку (мастеру
+        # останется ссылка).
+        return self._names.get(user_id, ("", ""))[0]
+
+    def user_link(self, user_id):
+        # По числовому id ссылку на человека Telegram не даёт. Есть @username —
+        # ведём на t.me/username; нет — показываем сам номер, чтобы мастер хотя
+        # бы отличал клиентов и мог найти переписку у себя в чате с ботом.
+        username = self._names.get(user_id, ("", ""))[1]
+        return f"t.me/{username}" if username else f"tg id {user_id}"
+
+    def _remember(self, sender):
+        """Запомнить имя и @username отправителя — из поля from входящего."""
+        name = f"{sender.get('first_name', '')} {sender.get('last_name', '')}".strip()
+        self._names[sender["id"]] = (name, sender.get("username", ""))
+
+    def listen(self):
+        while True:
+            try:
+                updates = self._call(
+                    "getUpdates",
+                    {"offset": self._offset, "timeout": self.POLL_SECONDS},
+                    timeout=self.POLL_TIMEOUT,
+                )
+            except MessengerError as error:
+                # Обрыв связи не должен ронять бота: подождём и спросим снова.
+                print(f"Telegram: {error}; повтор через 5 c")
+                time.sleep(5)
+                continue
+            for update in updates:
+                # offset двигаем всегда, даже если сообщение нам не подходит,
+                # иначе это же обновление вернётся в следующем запросе и цикл
+                # застрянет на нём навсегда.
+                self._offset = update["update_id"] + 1
+                message = update.get("message")
+                if not message or "text" not in message:
+                    continue  # не сообщение или без текста (стикер, фото) — мимо
+                sender = message["from"]
+                self._remember(sender)
+                yield Incoming(Client(self.platform, sender["id"]), message["text"])
 
 
 # =========================================================================
