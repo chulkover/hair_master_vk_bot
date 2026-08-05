@@ -549,8 +549,39 @@ check("клиента с шага кабинета уводит в меню",
 check("и он ничего не закрыл", schedule.all_closures() == [])
 
 
-# --- 16. Живые данные -----------------------------------------------------
-print("\n16. Живые данные")
+# --- 16. Контакт запоминается ---------------------------------------------
+print("\n16. Контакт запоминается")
+
+# Без этой отметки не заработает связка аккаунтов: найти человека по
+# «vk.com/chuul» можно только у себя — ВК по домену чужой номер не отдаёт.
+vk_api.PEOPLE[CLIENT] = ("Мария", "Петрова", "chuul")
+db.execute("DELETE FROM contacts")
+
+main.remember_contact(who(CLIENT))
+noted = db.get_contact("vk", CLIENT)
+check("контакт записан", noted is not None)
+check("имя из ВК", noted and noted["name"] == "Мария Петрова")
+check("домен из ВК", noted and noted["handle"] == "chuul")
+check("человек находится по домену",
+      (db.find_contact("vk", "chuul") or {}).get("user_id") == CLIENT)
+
+# Домен известен и день сегодняшний — второй раз ВК не дёргаем.
+vk_api.PEOPLE[CLIENT] = ("Мария", "Иванова", "chuul")
+main.remember_contact(who(CLIENT))
+check("за день повторно ВК не спрашиваем",
+      db.get_contact("vk", CLIENT)["name"] == "Мария Петрова")
+
+# У страницы без короткого имени ВК отдаёт «id777» — тоже годная ссылка.
+vk_api.PEOPLE[777] = ("Пётр", "Сидоров")
+main.remember_contact(who(777))
+check("без короткого имени домен как «idN»",
+      db.get_contact("vk", 777)["handle"] == "id777")
+
+vk_api.PEOPLE[CLIENT] = ("Мария", "Петрова")
+
+
+# --- 17. Живые данные -----------------------------------------------------
+print("\n17. Живые данные")
 
 check("боевая база не тронута",
       (config.DB_FILE.stat().st_mtime if config.DB_FILE.exists() else None)

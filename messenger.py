@@ -101,6 +101,19 @@ class Messenger:
         """Ссылка на страницу пользователя — чтобы мастер открыл её одним кликом."""
         raise NotImplementedError
 
+    def contact(self, user_id):
+        """Имя и короткое имя аккаунта: («Мария Петрова», «chuul»).
+
+        Короткое имя — то, чем человека называют вместо номера: @username
+        в Telegram, домен страницы в ВК. Нужно для связки аккаунтов: человек
+        присылает «vk.com/chuul» или «@d_chul», и найти по такому имени номер
+        мы можем только у себя — мессенджеры по чужому имени номер не выдают.
+
+        Что не узнали, отдаём пустой строкой, а не ошибкой: не знать имя
+        неприятно, но не смертельно.
+        """
+        raise NotImplementedError
+
     def listen(self):
         """Бесконечно отдавать входящие сообщения как Incoming(user_id, text).
 
@@ -178,23 +191,33 @@ class VkMessenger(Messenger):
                 keyboard.add_button(label, VkKeyboardColor.SECONDARY)
         return keyboard.get_keyboard()
 
-    def user_name(self, user_id):
-        """Имя клиента: «Мария Петрова» — или пустая строка, если не узнали.
+    def contact(self, user_id):
+        """Имя и домен страницы: («Мария Петрова», «chuul»). Спрашиваем ВК.
 
-        Спрашиваем ВК при каждой отправке. Записей единицы в день, а своя
-        таблица клиентов с именами — это уже отдельное хозяйство, которое надо
-        заполнять и чистить.
+        Домен — то, что стоит в адресе страницы после vk.com. У страницы,
+        которой короткое имя не задавали, он выглядит как «id12345» — и это
+        тоже годится: по такой ссылке человек находится ничуть не хуже.
 
         Ловим любую ошибку, а не только ApiError: удалённая страница,
         оборванная сеть или заглушка vk_api в тестах не должны мешать мастеру
         узнать о записи. В худшем случае останется одна ссылка.
         """
         try:
-            person = self._api.users.get(user_ids=user_id)[0]
-            return f"{person['first_name']} {person['last_name']}".strip()
+            person = self._api.users.get(user_ids=user_id, fields="domain")[0]
+            name = f"{person['first_name']} {person['last_name']}".strip()
+            return name, person.get("domain", "")
         except Exception as error:
-            print(f"не смогла узнать имя {user_id}: {error}")
-            return ""
+            print(f"не смогла узнать данные {user_id}: {error}")
+            return "", ""
+
+    def user_name(self, user_id):
+        """Имя клиента: «Мария Петрова» — или пустая строка, если не узнали.
+
+        Спрашиваем ВК при каждой отправке. Записей единицы в день, а держать
+        имена про запас незачем: в contacts они лежат для поиска по короткому
+        имени, а не чтобы показывать мастеру устаревшее.
+        """
+        return self.contact(user_id)[0]
 
     def user_link(self, user_id):
         # Ссылка вида vk.com/id123456: мастеру достаточно кликнуть, чтобы
@@ -284,17 +307,25 @@ class TgMessenger(Messenger):
             return {"remove_keyboard": True}
         return {"keyboard": rows, "resize_keyboard": True}
 
+    def contact(self, user_id):
+        """Имя и @username из последнего входящего: («Мария П», «masha»).
+
+        Спросить Telegram по чужому номеру нельзя — такого метода у Bot API
+        нет. Зато и имя, и @username лежат в каждом входящем сообщении, откуда
+        мы их и запомнили. Не писал боту — вернём две пустые строки.
+        """
+        return self._names.get(user_id, ("", ""))
+
     def user_name(self, user_id):
-        # Только из того, что человек сам прислал: имя запомнено при входящем
-        # сообщении. Не писал боту — имени нет, вернём пустую строку (мастеру
-        # останется ссылка).
-        return self._names.get(user_id, ("", ""))[0]
+        # Только из того, что человек сам прислал (см. contact). Не писал
+        # боту — имени нет, вернём пустую строку: мастеру останется ссылка.
+        return self.contact(user_id)[0]
 
     def user_link(self, user_id):
         # По числовому id ссылку на человека Telegram не даёт. Есть @username —
         # ведём на t.me/username; нет — показываем сам номер, чтобы мастер хотя
         # бы отличал клиентов и мог найти переписку у себя в чате с ботом.
-        username = self._names.get(user_id, ("", ""))[1]
+        username = self.contact(user_id)[1]
         return f"t.me/{username}" if username else f"tg id {user_id}"
 
     def _remember(self, sender):
@@ -379,6 +410,9 @@ class Bot:
 
     def user_link(self, client):
         return self.by(client.platform).user_link(client.id)
+
+    def contact(self, client):
+        return self.by(client.platform).contact(client.id)
 
     def _pump(self, channel, box):
         """Слушать один канал и складывать входящие в общую очередь `box`.
