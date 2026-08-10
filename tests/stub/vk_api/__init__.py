@@ -1,5 +1,11 @@
 """Заглушка vk_api: перехватывает отправку, никуда не ходит по сети."""
+from vk_api.exceptions import ApiError
+
 SENT = []
+
+# {user_id: код ошибки} — send() на этом номере вместо отправки бросит
+# ApiError(code). Пусто по умолчанию: обычные тесты отправку не ловят.
+FAIL = {}
 
 # Кого «знает» ВКонтакте: {номер: (имя, фамилия)} или {номер: (имя, фамилия,
 # домен)}. Бот спрашивает имя, когда пишет мастеру о новой записи, а домен —
@@ -11,6 +17,9 @@ PEOPLE = {}
 
 class _Messages:
     def send(self, **params):
+        user_id = params.get("user_id")
+        if user_id in FAIL:
+            raise ApiError(code=FAIL[user_id])
         SENT.append(params)
 
 

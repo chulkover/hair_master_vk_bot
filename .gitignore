@@ -1,5 +1,9 @@
 # секреты — токен НИКОГДА не должен попадать в git
 token.txt
+tg_token.txt
+
+# рабочие заметки для Claude Code — в git не едут
+CLAUDE.md
 
 # виртуальное окружение и мусор python
 .venv/
@@ -8,6 +12,9 @@ __pycache__/
 
 # настройки PyCharm (можно и оставить, но обычно их не коммитят)
 .idea/
+
+# индекс codegraph — локальный, пересобирается командой codegraph init
+.codegraph/
 
 # данные бота
 schedule.txt

@@ -20,7 +20,9 @@ main.py разговаривает с клиентом одними и теми 
 """
 
 import collections
+import html
 import queue
+import re
 import threading
 import time
 
@@ -97,8 +99,26 @@ class Messenger:
         """Имя пользователя строкой — или пустая строка, если не узнали."""
         raise NotImplementedError
 
-    def user_link(self, user_id):
-        """Ссылка на страницу пользователя — чтобы мастер открыл её одним кликом."""
+    def user_link(self, user_id, handle=""):
+        """Адрес страницы пользователя — или пустая строка, если его нет.
+
+        handle — короткое имя аккаунта (@username, домен ВК), если вызывающий
+        сохранил его у себя. Мессенджер помнит своих собеседников только пока
+        работает; после перезапуска бота подсказка со стороны — единственный
+        способ собрать ссылку, поэтому её и передают.
+
+        Пустая строка вместо адреса — нормальный ответ, а не сбой: в Telegram
+        у человека без @username страницы попросту не существует.
+        """
+        raise NotImplementedError
+
+    def link(self, name, url):
+        """Имя, по которому можно кликнуть, — как тег <a href> на сайте.
+
+        В сообщении видно только имя, а открывается по нему адрес. Разметка
+        для этого у каждого мессенджера своя, поэтому склеивает имя с адресом
+        тот мессенджер, в котором сообщение будут читать.
+        """
         raise NotImplementedError
 
     def contact(self, user_id):
@@ -219,10 +239,28 @@ class VkMessenger(Messenger):
         """
         return self.contact(user_id)[0]
 
-    def user_link(self, user_id):
-        # Ссылка вида vk.com/id123456: мастеру достаточно кликнуть, чтобы
-        # увидеть, кто записался.
-        return f"vk.com/id{user_id}"
+    # Своя страница в разметке ВК — [id555|Мария Петрова]: показывается имя,
+    # открывается страница. Работает это только для страниц самого ВК, поэтому
+    # адрес сверяем с шаблоном, а не подставляем что придёт.
+    OWN_PAGE = re.compile(r"https://vk\.com/(id\d+)")
+
+    def user_link(self, user_id, handle=""):
+        # Строим из номера, а не из домена (handle): страница vk.com/id555
+        # открывается и у того, кто короткое имя себе не задавал. Полный адрес
+        # с «https://» — без протокола ВК не всегда делает текст кликабельным.
+        return f"https://vk.com/id{user_id}"
+
+    def link(self, name, url):
+        page = self.OWN_PAGE.fullmatch(url)
+        if not page:
+            # Чужой адрес (та же t.me) подписать нечем: разметка ВК умеет
+            # только свои страницы. Показываем имя и адрес рядом — сам адрес
+            # ВК сделает кликабельным.
+            return f"{name} — {url}"
+        # Скобки и черта — служебные символы этой разметки: попадись они
+        # в имени, ВК показал бы вместо ссылки кусок разметки.
+        clean = name.replace("[", "(").replace("]", ")").replace("|", "/")
+        return f"[{page.group(1)}|{clean}]"
 
     def listen(self):
         for event in self._longpoll.listen():
@@ -287,12 +325,21 @@ class TgMessenger(Messenger):
             )
         return data["result"]
 
+    # По этому куску send() узнаёт сообщение со ссылкой из link().
+    LINK_TAG = '<a href="'
+
     def send(self, user_id, text, rows=None):
         params = {
             "chat_id": user_id,
             "text": text,
             "reply_markup": self._keyboard(rows),
         }
+        # Разбор разметки включаем только там, где она правда есть. Включи его
+        # всегда — и Telegram начал бы искать теги в обычном тексте: любая
+        # угловая скобка в имени клиента или в причине отмены превращала бы
+        # отправку безобидного сообщения в ошибку.
+        if self.LINK_TAG in text:
+            params["parse_mode"] = "HTML"
         self._call("sendMessage", params)
 
     def _keyboard(self, rows):
@@ -321,12 +368,20 @@ class TgMessenger(Messenger):
         # боту — имени нет, вернём пустую строку: мастеру останется ссылка.
         return self.contact(user_id)[0]
 
-    def user_link(self, user_id):
-        # По числовому id ссылку на человека Telegram не даёт. Есть @username —
-        # ведём на t.me/username; нет — показываем сам номер, чтобы мастер хотя
-        # бы отличал клиентов и мог найти переписку у себя в чате с ботом.
-        username = self.contact(user_id)[1]
-        return f"t.me/{username}" if username else f"tg id {user_id}"
+    def user_link(self, user_id, handle=""):
+        # По числовому id ссылку на человека Telegram не даёт — нужен @username.
+        # Свежий берём из входящего сообщения, а если бот с тех пор
+        # перезапускался, `_names` пуст: тогда выручает handle, сохранённый
+        # вызывающим. Нет ни того, ни другого — страницы у человека просто нет,
+        # и честнее отдать пустую строку, чем выдуманный адрес.
+        username = self.contact(user_id)[1] or handle
+        return f"https://t.me/{username}" if username else ""
+
+    def link(self, name, url):
+        # Телеграм подписывает ссылки html-тегом; parse_mode в send() включится
+        # сам, как увидит этот тег. Имя пропускаем через escape: угловая скобка
+        # или амперсанд внутри имени иначе сломали бы разбор всего сообщения.
+        return f'<a href="{url}">{html.escape(name)}</a>'
 
     def _remember(self, sender):
         """Запомнить имя и @username отправителя — из поля from входящего."""
@@ -408,8 +463,16 @@ class Bot:
     def user_name(self, client):
         return self.by(client.platform).user_name(client.id)
 
-    def user_link(self, client):
-        return self.by(client.platform).user_link(client.id)
+    def user_link(self, client, handle=""):
+        return self.by(client.platform).user_link(client.id, handle)
+
+    def link(self, reader, name, url):
+        """Кликабельное имя в разметке того, кто это сообщение прочитает.
+
+        Разметку выбирает мессенджер получателя (reader), а не того, о ком
+        речь: в переписке ВК ссылку на телеграм-страницу пишут по правилам ВК.
+        """
+        return self.by(reader.platform).link(name, url)
 
     def contact(self, client):
         return self.by(client.platform).contact(client.id)

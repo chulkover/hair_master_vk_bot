@@ -686,10 +686,11 @@ def move_booking(booking_id, platform, user_id, day, start, minutes, service,
                "length", "density", "price_from", "price_to", "status"]
 
     with db.transaction():
+        owner, owner_params = whose(platform, user_id)
         old = db.query_one(
-            f"SELECT id FROM bookings WHERE id = ? AND platform = ? "
-            f"AND user_id = ? AND status IN ({placeholders(ACTIVE_STATUSES)})",
-            (booking_id, platform, user_id) + ACTIVE_STATUSES,
+            f"SELECT id FROM bookings WHERE id = ? AND {owner} "
+            f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
+            (booking_id,) + owner_params + ACTIVE_STATUSES,
         )
         if old is None:
             return None  # чужая, отменённая или уже перенесённая
@@ -719,16 +720,32 @@ def move_booking(booking_id, platform, user_id, day, start, minutes, service,
 # 5. Записи клиента и отмена
 # =========================================================================
 
-def active_condition(only_future=True):
+def whose(platform, user_id):
+    """Условие «строка принадлежит этому человеку» и значения к нему.
+
+    Человек — это не одна пара (platform, user_id): связав ВК и Telegram, он
+    пишет боту с двух аккаунтов, и записи обоих должны считаться его. Поэтому
+    спрашиваем у базы все его аккаунты и собираем условие по каждому.
+
+    Связки нет — список из одного элемента, и условие выходит ровно такое же,
+    каким было раньше. Ничего чинить в остальном коде не пришлось.
+    """
+    pairs = db.linked_identities(platform, user_id)
+    sql = "(" + " OR ".join(["(platform = ? AND user_id = ?)"] * len(pairs)) + ")"
+    params = tuple(value for pair in pairs for value in pair)
+    return sql, params
+
+
+def active_condition(platform, user_id, only_future=True):
     """Условие «активная запись клиента» и значения к нему.
 
     Отбор одинаков у списка записей и у их подсчёта, а держать его в двух
     запросах — это два места, где можно разойтись. Возвращаем кусок SQL и
     параметры к нему, чтобы условие было написано один раз.
     """
-    sql = (f"platform = ? AND user_id = ? "
-           f"AND status IN ({placeholders(ACTIVE_STATUSES)})")
-    params = ACTIVE_STATUSES
+    owner, params = whose(platform, user_id)
+    sql = f"{owner} AND status IN ({placeholders(ACTIVE_STATUSES)})"
+    params += ACTIVE_STATUSES
 
     if only_future:
         # Прошлую процедуру отменять уже поздно, и в лимит она не идёт.
@@ -740,10 +757,10 @@ def active_condition(only_future=True):
 
 def user_bookings(platform, user_id, only_future=True):
     """Активные записи одного клиента, по возрастанию даты."""
-    condition, params = active_condition(only_future)
+    condition, params = active_condition(platform, user_id, only_future)
     return db.query(
         f"SELECT * FROM bookings WHERE {condition} ORDER BY date, start",
-        (platform, user_id) + params,
+        params,
     )
 
 
@@ -753,9 +770,9 @@ def active_count(platform, user_id):
     Считает база: вытаскивать записи, чтобы тут же их посчитать, незачем.
     Прошла процедура — счётчик уменьшился сам, отдельно её нигде не закрываем.
     """
-    condition, params = active_condition()
+    condition, params = active_condition(platform, user_id)
     row = db.query_one(f"SELECT count(*) AS n FROM bookings WHERE {condition}",
-                       (platform, user_id) + params)
+                       params)
     return row["n"]
 
 
@@ -776,11 +793,12 @@ def cancel_booking(booking_id, platform, user_id):
     уже отменённая или несуществующая дают один и тот же ответ: ноль
     изменённых строк, то есть None. Читать базу дважды для этого не нужно.
     """
+    owner, owner_params = whose(platform, user_id)
     changed = db.execute(
         f"UPDATE bookings SET status = 'CANCELLED' "
-        f"WHERE id = ? AND platform = ? AND user_id = ? "
+        f"WHERE id = ? AND {owner} "
         f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
-        (booking_id, platform, user_id) + ACTIVE_STATUSES,
+        (booking_id,) + owner_params + ACTIVE_STATUSES,
     )
 
     if not changed:
@@ -860,20 +878,20 @@ def cancel_many_by_master(bookings, reason):
 
 def user_subscriptions(platform, user_id):
     """Подписки одного клиента, по возрастанию даты."""
+    owner, params = whose(platform, user_id)
     return db.query(
-        "SELECT * FROM subscriptions "
-        "WHERE platform = ? AND user_id = ? AND date >= ? "
-        "ORDER BY date",
-        (platform, user_id, date.today().isoformat()),
+        f"SELECT * FROM subscriptions WHERE {owner} AND date >= ? "
+        f"ORDER BY date",
+        params + (date.today().isoformat(),),
     )
 
 
 def subscriptions_count(platform, user_id):
     """Сколько дней клиент сейчас ждёт."""
+    owner, params = whose(platform, user_id)
     row = db.query_one(
-        "SELECT count(*) AS n FROM subscriptions "
-        "WHERE platform = ? AND user_id = ? AND date >= ?",
-        (platform, user_id, date.today().isoformat()),
+        f"SELECT count(*) AS n FROM subscriptions WHERE {owner} AND date >= ?",
+        params + (date.today().isoformat(),),
     )
     return row["n"]
 
@@ -904,10 +922,10 @@ def has_bookings(day):
 
 def is_subscribed(platform, user_id, day):
     """Клиент уже ждёт окошко в этот день?"""
+    owner, params = whose(platform, user_id)
     return db.query_one(
-        "SELECT 1 FROM subscriptions "
-        "WHERE platform = ? AND user_id = ? AND date = ?",
-        (platform, user_id, day),
+        f"SELECT 1 FROM subscriptions WHERE {owner} AND date = ?",
+        params + (day,),
     ) is not None
 
 
@@ -966,10 +984,10 @@ def remove_subscription(platform, user_id, day):
     Здесь, в отличие от записей, строка именно удаляется: история «кто чего
     ждал» никому не нужна, а сам факт подписки ничего не бронировал.
     """
+    owner, params = whose(platform, user_id)
     return db.execute(
-        "DELETE FROM subscriptions "
-        "WHERE platform = ? AND user_id = ? AND date = ?",
-        (platform, user_id, day),
+        f"DELETE FROM subscriptions WHERE {owner} AND date = ?",
+        params + (day,),
     ) > 0
 
 
@@ -1122,12 +1140,12 @@ def confirm_bookings(platform, user_id):
     now = moment_key(datetime.now())
 
     with db.transaction():
+        owner, params = whose(platform, user_id)
         confirmed = db.query(
-            "SELECT * FROM bookings "
-            "WHERE platform = ? AND user_id = ? AND status = ? "
-            "AND date || ' ' || start > ? "  # прошедшую подтверждать нечего
-            "ORDER BY date, start",
-            (platform, user_id, ASKED_STATUS, now),
+            f"SELECT * FROM bookings WHERE {owner} AND status = ? "
+            f"AND date || ' ' || start > ? "  # прошедшую подтверждать нечего
+            f"ORDER BY date, start",
+            params + (ASKED_STATUS, now),
         )
 
         if confirmed:

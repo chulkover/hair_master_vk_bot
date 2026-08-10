@@ -384,7 +384,8 @@ check("владелец на шаге расписания", owner_state() == ma
 
 answer = owner(schedule.day_label(DAY))
 check("день раскрылся по часам", "10:00" in answer, answer)
-check("с ссылкой на клиента", f"vk.com/id{CLIENT}" in answer)
+# Имя этого клиента ВК ещё не отдавал — значит, в карточке голая ссылка.
+check("с ссылкой на клиента", f"vk.com/id{CLIENT}" in answer, answer)
 
 # Шаг владельца остался в базе, а владельцем этот номер быть перестал.
 main.get_user(who(CLIENT))["state"] = main.OWNER_SCHEDULE
@@ -408,8 +409,11 @@ check("без клавиатуры", "keyboard" not in to_owner[0])
 check("имя клиента подставилось",
       main.client_name(who(CLIENT)) == "Мария Петрова", main.client_name(who(CLIENT)))
 check("незнакомый номер не роняет карточку",
-      main.client_card(who(404)) == "Клиент: vk.com/id404",
+      main.client_card(who(404)) == "Клиент: https://vk.com/id404",
       main.client_card(who(404)))
+check("имя клиента кликабельно — как ссылка на сайте",
+      main.client_card(who(CLIENT)) == f"Клиент: [id{CLIENT}|Мария Петрова]",
+      main.client_card(who(CLIENT)))
 
 saved_owner = config.OWNER_ID
 config.OWNER_ID = 0
@@ -601,6 +605,16 @@ class FakeTg:
     def contact(self, user_id):
         return ("Мария Т", "d_chul")
 
+    def user_name(self, user_id):
+        return self.contact(user_id)[0]
+
+    def user_link(self, user_id, handle=""):
+        username = self.contact(user_id)[1] or handle
+        return f"https://t.me/{username}" if username else ""
+
+    def link(self, name, url):
+        return f'<a href="{url}">{name}</a>'
+
 
 fake_tg = FakeTg()
 main.bot._messengers["tg"] = fake_tg
@@ -634,6 +648,8 @@ check("заявка заведена", (db.link_for("vk", CLIENT) or {}).get("st
 check("запрос ушёл в Telegram", len(fake_tg.sent) == 1)
 check("в запросе видно, кто просит",
       "Мария Петрова" in fake_tg.sent[-1][1], fake_tg.sent[-1][1])
+check("и ссылка на его страницу",
+      "vk.com/id555" in fake_tg.sent[-1][1], fake_tg.sent[-1][1])
 check("до подтверждения аккаунты не связаны",
       db.linked_identities("vk", CLIENT) == [("vk", CLIENT)])
 
@@ -643,7 +659,8 @@ linked = db.linked_identities("vk", CLIENT)
 check("после «Да» аккаунты связаны", linked == [("vk", CLIENT), ("tg", 777)],
       str(linked))
 check("инициатору сообщили",
-      "подтвердил связку" in vk_api.SENT[-1]["message"],
+      "Связку подтвердил" in vk_api.SENT[-1]["message"]
+      and "t.me/d_chul" in vk_api.SENT[-1]["message"],
       vk_api.SENT[-1]["message"])
 
 # Второй раз связать нельзя: одна связка на аккаунт.
@@ -653,7 +670,18 @@ check("теперь предлагают отвязать",
       main.UNLINK_BUTTON in vk_api.SENT[-1]["keyboard"])
 
 msg(main.UNLINK_BUTTON)
-check("после отвязки личность одна",
+check("перед отвязкой спрашивают подтверждение",
+      "Точно отвязать" in vk_api.SENT[-1]["message"], vk_api.SENT[-1]["message"])
+check("связка ещё цела",
+      db.linked_identities("vk", CLIENT) != [("vk", CLIENT)])
+
+msg(main.UNLINK_NO)
+check("«Нет» — связка осталась",
+      db.linked_identities("vk", CLIENT) != [("vk", CLIENT)])
+
+msg(main.UNLINK_BUTTON)
+msg(main.UNLINK_YES)
+check("после «Да» отвязка прошла",
       db.linked_identities("vk", CLIENT) == [("vk", CLIENT)])
 check("второму аккаунту сообщили об отвязке",
       "снята" in fake_tg.sent[-1][1])
@@ -676,8 +704,45 @@ del main.bot._messengers["tg"]
 db.execute("DELETE FROM links")
 
 
-# --- 18. Живые данные -----------------------------------------------------
-print("\n18. Живые данные")
+# --- 18. Уведомление связанному аккаунту о записи --------------------------
+print("\n18. Уведомление связанному аккаунту о записи")
+
+main.users.clear()
+db.forget_dialog("vk", CLIENT)
+for old in schedule.user_bookings("vk", CLIENT):
+    schedule.cancel_booking(old["id"], "vk", CLIENT)
+
+fake_tg = FakeTg()
+main.bot._messengers["tg"] = fake_tg
+db.execute("DELETE FROM links")
+db.save_contact("vk", CLIENT, "Мария Петрова", "chuul")
+db.save_contact("tg", 777, "Мария Т", "d_chul")
+db.add_link_request("vk", CLIENT, "tg", 777)
+db.confirm_link("vk", CLIENT, "tg", 777)
+
+user = main.get_user(who(CLIENT))
+user.update(day=work_day(5), time="11:00", minutes=90, service="cold",
+           length="short", density="thin", price_from=2100, price_to=2400)
+fake_tg.sent.clear()
+main.save_booking(who(CLIENT))
+check("связанному Telegram пришло уведомление о записи",
+      len(fake_tg.sent) == 1 and "Через ВКонтакте выполнена запись"
+      in fake_tg.sent[-1][1], str(fake_tg.sent))
+
+booking = schedule.user_bookings("vk", CLIENT)[0]
+main.get_user(who(CLIENT))["cancel_id"] = booking["id"]
+fake_tg.sent.clear()
+main.do_cancel(who(CLIENT))
+check("связанному Telegram пришло уведомление об отмене",
+      len(fake_tg.sent) == 1 and "Через ВКонтакте отменена запись"
+      in fake_tg.sent[-1][1], str(fake_tg.sent))
+
+del main.bot._messengers["tg"]
+db.execute("DELETE FROM links")
+
+
+# --- 19. Живые данные -----------------------------------------------------
+print("\n19. Живые данные")
 
 check("боевая база не тронута",
       (config.DB_FILE.stat().st_mtime if config.DB_FILE.exists() else None)

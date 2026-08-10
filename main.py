@@ -99,6 +99,25 @@ def notify_owner(text):
         print(f"не смогла написать владельцу: {error}")
 
 
+def notify_partner(user_id, text):
+    """Сообщить связанному аккаунту о записи — с обновлённой клавиатурой.
+
+    В отличие от notify_owner, клавиатуру шлём: у клиента на кнопке «Мои
+    записи» — счётчик, а после действия на другой площадке он обязан стать
+    верным сам, без захода в меню. Если связки нет, тихо ничего не делаем —
+    identities тогда состоит из одного элемента, самого user_id.
+    """
+    identities = db.linked_identities(user_id.platform, user_id.id)
+    if len(identities) < 2:
+        return
+
+    partner = messenger.Client(*identities[1])
+    try:
+        send(partner, text, menu_keyboard(partner))
+    except messenger.MessengerError as error:
+        print(f"не смогла написать связанному аккаунту: {error}")
+
+
 def client_name(user_id):
     """Имя клиента: «Мария Петрова» — или пустая строка, если не узнали.
 
@@ -109,11 +128,38 @@ def client_name(user_id):
     return bot.user_name(user_id)
 
 
+def name_and_link(target, reader):
+    """Имя человека `target`, кликабельное для того, кто это прочитает.
+
+    В сообщении видно одно имя, и оно же открывает страницу — как ссылка
+    на сайте, а не адрес отдельной строкой рядом. Разметка у мессенджеров
+    разная, поэтому имя с адресом склеивает мессенджер получателя (reader),
+    см. Messenger.link().
+
+    Имя и короткое имя аккаунта, если мессенджер их не помнит, достаём
+    из базы. Telegram отдаёт их только во входящем сообщении, а те живут
+    в памяти процесса — после перезапуска бота вместо ссылки был бы виден
+    голый номер. В базе они лежат с прошлых сообщений, см. remember_contact().
+    """
+    known = db.get_contact(target.platform, target.id)
+    name = client_name(target) or (known["name"] if known else "")
+    handle = known["handle"] if known else ""
+
+    url = bot.user_link(target, handle)
+    if not url:
+        # Телеграм-аккаунт без @username: страницы, на которую вести, нет.
+        # Номер показываем только если и имени не знаем — иначе он лишний.
+        return name or f"{PLATFORM_NAMES[target.platform]} id {target.id}"
+    return bot.link(reader, name, url) if name else url
+
+
 def client_card(user_id):
-    """Кто клиент — строкой для сообщения мастеру: имя и ссылка на страницу."""
-    link = bot.user_link(user_id)
-    name = client_name(user_id)
-    return f"Клиент: {name}\n{link}" if name else f"Клиент: {link}"
+    """Кто клиент — строкой для сообщения мастеру: кликабельное имя.
+
+    Получателя не спрашиваем: карточку читает всегда мастер, а он у нас
+    один и всегда со стороны ВК, см. owner().
+    """
+    return f"Клиент: {name_and_link(user_id, owner())}"
 
 
 def client_of(row):
@@ -147,8 +193,9 @@ MY_SUBS = "MY_SUBS"                        # список подписок и о
 SELECTING_SUB_DATE = "SELECTING_SUB_DATE"  # выбор дня для подписки
 SUB_CONFIRM = "SUB_CONFIRM"                # «подписать вас на 31.07?»
 
-PROFILE = "PROFILE"          # профиль: связка аккаунтов ВК и Telegram
-LINK_HANDLE = "LINK_HANDLE"  # ждём ссылку на аккаунт в другом мессенджере
+PROFILE = "PROFILE"                  # профиль: связка аккаунтов ВК и Telegram
+LINK_HANDLE = "LINK_HANDLE"          # ждём ссылку на аккаунт в другом мессенджере
+UNLINK_CONFIRM = "UNLINK_CONFIRM"    # «точно отвязать?»
 
 # --- шаги владельца -------------------------------------------------------
 # Их много, но устроены они одинаково: почти ничего не помнят между
@@ -402,6 +449,16 @@ UNLINK_BUTTON = "Отвязать аккаунт"
 # на что отвечает.
 LINK_YES = "Да, это я"
 LINK_NO = "Нет, это не я"
+
+# Отвязка необратима так же, как отмена записи — и подтверждаем её так же.
+UNLINK_YES = "Да, отвязать"
+UNLINK_NO = "Нет, оставить"
+
+UNLINK_KEYBOARD = build_keyboard([
+    [UNLINK_YES],
+    [UNLINK_NO],
+    [BACK_TO_MENU],
+])
 
 # Как мессенджер называется в разговоре с человеком: «vk» в тексте выглядит
 # как ошибка, а «ВКонтакте» — как речь.
@@ -1059,6 +1116,14 @@ def save_booking(user_id):
     if previous is not None:
         notify_subscribers(previous)
 
+    verb = "перенесена запись" if previous is not None else "выполнена запись"
+    notify_partner(
+        user_id,
+        f"Через {PLATFORM_NAMES[user_id.platform]} {verb} на "
+        f"{schedule.pretty_date(booking['date'])} в {booking['start']}.\n\n"
+        f"Процедура: {config.SERVICES[booking['service']]['title']}",
+    )
+
 
 # =========================================================================
 # 8. Подписка на свободное окошко и отписка
@@ -1451,6 +1516,12 @@ def do_cancel(user_id):
                  f"{client_card(user_id)}"
                  f"{late_note(booking)}")
     notify_subscribers(booking)
+
+    notify_partner(
+        user_id,
+        f"Через {PLATFORM_NAMES[user_id.platform]} отменена запись "
+        f"на {schedule.pretty_date(booking['date'])} в {booking['start']}.",
+    )
 
 
 def do_confirm(user_id):
@@ -2546,9 +2617,9 @@ def link_status(user_id):
     """Строка о связке для профиля: с кем связан или что не связан."""
     linked = db.linked_identities(user_id.platform, user_id.id)
     for platform, number in linked[1:]:
-        contact = db.get_contact(platform, number) or {}
-        name = contact.get("name") or contact.get("handle") or number
-        return f"Аккаунт связан с {PLATFORM_NAMES[platform]}: {name}."
+        partner = messenger.Client(platform, number)
+        return (f"Аккаунт связан с {PLATFORM_NAMES[platform]}: "
+                f"{name_and_link(partner, user_id)}")
 
     waiting = db.link_for(user_id.platform, user_id.id)
     if waiting:
@@ -2623,16 +2694,13 @@ def do_link(user_id, text):
 
     db.add_link_request(user_id.platform, user_id.id, target.platform, target.id)
 
-    # Кто просит: имя, а если его не узнали — короткое имя. Человек на той
-    # стороне должен понять, кому он открывает свои записи.
-    me = db.get_contact(user_id.platform, user_id.id) or {}
-    who = me.get("name") or me.get("handle") or user_id.id
-
+    # Кто просит: имя со ссылкой на страницу — человек на той стороне должен
+    # понять, кому он открывает свои записи, не гадая по одному лишь имени.
     bot.send(target,
-             f"Пользователь {who} желает связать с вами аккаунт "
-             f"{PLATFORM_NAMES[user_id.platform]}. Подтверждаем?\n\n"
-             f"После связки записи и подписки станут общими: их будет видно "
-             f"и здесь, и в {PLATFORM_NAMES[user_id.platform]}.",
+             f"Связать с вами аккаунт {PLATFORM_NAMES[user_id.platform]} "
+             f"хочет: {name_and_link(user_id, target)}\n\n"
+             f"Подтверждаем? После связки записи и подписки станут общими: "
+             f"их будет видно и здесь, и в {PLATFORM_NAMES[user_id.platform]}.",
              build_keyboard([[LINK_YES], [LINK_NO]]))
 
     name = found["name"] or handle
@@ -2654,23 +2722,30 @@ def do_link_answer(user_id, agreed):
         return
 
     asker = messenger.Client(request["a_platform"], request["a_id"])
-    me = db.get_contact(user_id.platform, user_id.id) or {}
-    who = me.get("name") or me.get("handle") or user_id.id
+    # Обе строки ниже читает инициатор — под его мессенджер и размечаем имя.
+    who = name_and_link(user_id, asker)
 
     if agreed:
         db.confirm_link(asker.platform, asker.id,
                         user_id.platform, user_id.id)
         send(user_id, f"Готово: аккаунты связаны. Записи и подписки "
                       f"из {PLATFORM_NAMES[asker.platform]} теперь видно здесь.")
-        send(asker, f"Пользователь {who} подтвердил связку. Записи и подписки "
-                    f"теперь общие.", menu_keyboard(asker))
+        send(asker, f"Связку подтвердил: {who}\n\nЗаписи и подписки теперь "
+                    f"общие.", menu_keyboard(asker))
     else:
         db.drop_links(user_id.platform, user_id.id)
         send(user_id, "Хорошо, аккаунты не связаны.")
-        send(asker, f"Пользователь {who} отклонил связку аккаунтов.",
-             menu_keyboard(asker))
+        send(asker, f"Связку отклонил: {who}", menu_keyboard(asker))
 
     show_menu(user_id)
+
+
+def ask_unlink_confirm(user_id):
+    """Спросить перед отвязкой: действие необратимо, как отмена записи."""
+    get_user(user_id)["state"] = UNLINK_CONFIRM
+    send(user_id,
+         f"Точно отвязать аккаунт?\n\n{link_status(user_id)}",
+         UNLINK_KEYBOARD)
 
 
 def do_unlink(user_id):
@@ -2901,10 +2976,20 @@ def handle_message(user_id, text):
         if msg == LINK_BUTTON.lower():
             start_link(user_id)
         elif msg == UNLINK_BUTTON.lower():
-            do_unlink(user_id)
+            ask_unlink_confirm(user_id)
         else:
             send(user_id, "Не понял. Выберите кнопку ниже:")
             show_profile(user_id)
+        return
+
+    # --- подтверждение отвязки ---
+    if state == UNLINK_CONFIRM:
+        if msg == UNLINK_YES.lower():
+            do_unlink(user_id)
+        elif msg == UNLINK_NO.lower():
+            show_profile(user_id)
+        else:
+            send(user_id, "Выбери кнопку ниже:", UNLINK_KEYBOARD)
         return
 
     if state == LINK_HANDLE:

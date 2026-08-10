@@ -563,8 +563,51 @@ check("после сброса снова из config",
       schedule.work_weekdays() == config.WORK_DAYS)
 
 
-# --- 14. Живые данные не тронуты ------------------------------------------
-print("\n14. Живые данные")
+# --- 14. Связанные аккаунты видят общее -----------------------------------
+print("\n14. Связанные аккаунты")
+
+# Один человек, два бота: записался из ВК — видит запись в Telegram.
+LINK_DAY, LINK_DAY2 = work_days_ahead(2, 20)
+VK_ME, TG_ME = 9100, 9200
+
+shared = schedule.create_booking("vk", VK_ME, LINK_DAY, "10:00", 90, "cold",
+                                 "short", "thin", 2100, 2400)
+check("запись создана из ВК", shared is not None)
+check("до связки Telegram её не видит",
+      schedule.user_bookings("tg", TG_ME) == [])
+
+db.add_link_request("vk", VK_ME, "tg", TG_ME)
+db.confirm_link("vk", VK_ME, "tg", TG_ME)
+
+check("после связки Telegram видит запись",
+      [row["id"] for row in schedule.user_bookings("tg", TG_ME)]
+      == [shared["id"]])
+check("и наоборот, ВК видит ту же одну",
+      len(schedule.user_bookings("vk", VK_ME)) == 1)
+check("счётчик записей общий", schedule.active_count("tg", TG_ME) == 1)
+
+# Отменять чужое по-прежнему нельзя, а своё — из любого мессенджера.
+check("чужой аккаунт запись не отменит",
+      schedule.cancel_booking(shared["id"], "vk", CLIENT) is None)
+check("связанный отменяет запись из Telegram",
+      schedule.cancel_booking(shared["id"], "tg", TG_ME) is not None)
+
+# Подписки — так же: лимит и «уже жду» считаются на двоих.
+check("подписка из Telegram",
+      schedule.add_subscription("tg", TG_ME, LINK_DAY2, 90, "cold", "short",
+                                "thin", 2100, 2400) is not None)
+check("из ВК видно, что день уже ждём",
+      schedule.is_subscribed("vk", VK_ME, LINK_DAY2))
+check("подписка в списке у ВК",
+      len(schedule.user_subscriptions("vk", VK_ME)) == 1)
+check("отписка из ВК снимает подписку Telegram",
+      schedule.remove_subscription("vk", VK_ME, LINK_DAY2))
+check("подписок не осталось",
+      schedule.subscriptions_count("tg", TG_ME) == 0)
+
+
+# --- 15. Живые данные не тронуты ------------------------------------------
+print("\n15. Живые данные")
 
 check("schedule.txt не изменился",
       (LIVE_SCHEDULE.stat().st_mtime if LIVE_SCHEDULE.exists() else None)
