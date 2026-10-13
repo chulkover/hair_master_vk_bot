@@ -597,8 +597,8 @@ def busy_days(minutes, exclude_id=None):
 # =========================================================================
 
 def create_booking(platform, user_id, day, start, minutes, service, length,
-                   density, price_from, price_to):
-    """Проверить, что время свободно, и добавить запись.
+                   density, price_from, price_to, move_id=None):
+    """Проверить, что время свободно, и добавить запись — или перенести.
 
     Возвращает саму запись — или None, если окошко уже заняли.
 
@@ -609,6 +609,15 @@ def create_booking(platform, user_id, day, start, minutes, service, length,
 
     platform запоминаем вместе с записью: по нему потом решится, каким
     мессенджером напомнить клиенту о визите.
+
+    move_id — номер записи, которую эта заменяет (перенос). Отмена старой
+    и новая запись тогда — одно неделимое действие. Если делать по очереди
+    («сначала отмени, потом запишись заново»), между шагами старое время уже
+    улетит подписчикам, а нового может не оказаться: клиент останется вообще
+    без записи. Здесь же не сложилось — значит не изменилось ничего. Старая
+    получает статус MOVED, а не CANCELLED: в истории мастера «перенёс»
+    и «передумал» — разные события. None при переносе значит ещё и то, что
+    переносить уже нечего: запись чужая, отменённая или уже перенесённая.
     """
     booking = {
         "platform": platform,
@@ -630,83 +639,29 @@ def create_booking(platform, user_id, day, start, minutes, service, length,
     if minutes_left(booking) <= config.CONFIRM_BEFORE_HOURS * 60:
         booking["status"] = "CONFIRMED"
 
-    columns = ["platform", "user_id", "date", "start", "minutes", "service",
-               "length", "density", "price_from", "price_to", "status"]
+    columns = list(booking)
 
     with db.transaction():
-        if not is_free(bookings_on(day), day, to_minutes(start), minutes):
-            return None
+        if move_id is not None:
+            owner, owner_params = whose(platform, user_id)
+            old = db.query_one(
+                f"SELECT id FROM bookings WHERE id = ? AND {owner} "
+                f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
+                (move_id,) + owner_params + ACTIVE_STATUSES,
+            )
+            if old is None:
+                return None  # чужая, отменённая или уже перенесённая
 
-        # Номер выдаёт база, поэтому он появляется в записи только сейчас.
-        booking["id"] = db.insert(
-            f"INSERT INTO bookings ({', '.join(columns)}) "
-            f"VALUES ({placeholders(columns)})",
-            [booking[column] for column in columns],
-        )
-
-    return booking
-
-
-def move_booking(booking_id, platform, user_id, day, start, minutes, service,
-                 length, density, price_from, price_to):
-    """Перенести запись на другое время. Возвращает новую запись или None.
-
-    Отмена и новая запись одним неделимым действием — в этом весь смысл.
-    Если делать по очереди («сначала отмени, потом запишись заново»), между
-    двумя шагами старое время уже улетит подписчикам, а нового может не
-    оказаться: клиент останется вообще без записи. Здесь же не сложилось —
-    значит не изменилось ничего.
-
-    Старая запись получает статус MOVED, а не CANCELLED: в истории мастера
-    «перенёс» и «передумал» — разные события.
-
-    None означает, что время заняли, пока клиент выбирал, или что переносить
-    уже нечего. Оба случая для диалога одинаковы: показать свежие окошки.
-    """
-    booking = {
-        "platform": platform,
-        "user_id": user_id,
-        "date": day,
-        "start": start,
-        "minutes": minutes,
-        "service": service,
-        "length": length,
-        "density": density,
-        "price_from": price_from,
-        "price_to": price_to,
-        "status": "NEW",
-    }
-
-    # Та же логика, что и у новой записи: до процедуры меньше суток —
-    # спрашивать «придёте?» уже не о чем.
-    if minutes_left(booking) <= config.CONFIRM_BEFORE_HOURS * 60:
-        booking["status"] = "CONFIRMED"
-
-    columns = ["platform", "user_id", "date", "start", "minutes", "service",
-               "length", "density", "price_from", "price_to", "status"]
-
-    with db.transaction():
-        owner, owner_params = whose(platform, user_id)
-        old = db.query_one(
-            f"SELECT id FROM bookings WHERE id = ? AND {owner} "
-            f"AND status IN ({placeholders(ACTIVE_STATUSES)})",
-            (booking_id,) + owner_params + ACTIVE_STATUSES,
-        )
-        if old is None:
-            return None  # чужая, отменённая или уже перенесённая
-
-        # Себе самой запись не мешает: при переносе внутри одного дня она
-        # занимает как раз то время, рядом с которым клиент и выбирает.
-        # Без этого исключения перенос с 14:00 на 14:30 был бы невозможен.
-        others = [other for other in bookings_on(day)
-                  if other["id"] != booking_id]
-
+        # При переносе запись не мешает сама себе, см. without().
+        others = without(bookings_on(day), move_id)
         if not is_free(others, day, to_minutes(start), minutes):
             return None
 
-        db.execute("UPDATE bookings SET status = 'MOVED' WHERE id = ?",
-                   (booking_id,))
+        if move_id is not None:
+            db.execute("UPDATE bookings SET status = 'MOVED' WHERE id = ?",
+                       (move_id,))
 
+        # Номер выдаёт база, поэтому он появляется в записи только сейчас.
         booking["id"] = db.insert(
             f"INSERT INTO bookings ({', '.join(columns)}) "
             f"VALUES ({placeholders(columns)})",

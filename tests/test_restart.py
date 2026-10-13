@@ -407,7 +407,8 @@ check("владельцу написали", len(to_owner) == 1, str(vk_api.SENT
 check("без клавиатуры", "keyboard" not in to_owner[0])
 
 check("имя клиента подставилось",
-      main.client_name(who(CLIENT)) == "Мария Петрова", main.client_name(who(CLIENT)))
+      "Мария Петрова" in main.client_card(who(CLIENT)),
+      main.client_card(who(CLIENT)))
 check("незнакомый номер не роняет карточку",
       main.client_card(who(404)) == "Клиент: https://vk.com/id404",
       main.client_card(who(404)))
@@ -695,6 +696,19 @@ check("после «Нет» связки нет",
       db.linked_identities("vk", CLIENT) == [("vk", CLIENT)])
 check("и заявка убрана", db.link_for("vk", CLIENT) is None)
 
+# После отказа сразу слать новую заявку нельзя — иначе ею можно донимать.
+msg(main.PROFILE_BUTTON)
+answers = msg(main.LINK_BUTTON)
+check("после отказа новая заявка — только через сутки",
+      "через сутки" in " ".join(answers) and state() == main.PROFILE,
+      str(answers))
+main.link_declined.clear()
+
+msg(main.LINK_BUTTON)
+answers = msg("x" * 5000)
+check("длинный текст в ответе обрезан",
+      "не найдено" in answers[0] and len(answers[0]) < 1000, str(answers)[:200])
+
 check("разбор ссылок", [main.parse_handle(t) for t in
                         ("@d_chul", "vk.com/chuul", "https://vk.ru/chuul/",
                          "t.me/d_chul", "vk.com/id555")]
@@ -741,8 +755,19 @@ del main.bot._messengers["tg"]
 db.execute("DELETE FROM links")
 
 
-# --- 19. Живые данные -----------------------------------------------------
-print("\n19. Живые данные")
+# --- 19. Защита от флуда ----------------------------------------------------
+print("\n19. Защита от флуда")
+
+FLOODER = main.Client("vk", 9999)
+verdicts = [main.flooding(FLOODER) for _ in range(main.FLOOD_LIMIT + 1)]
+check("обычный темп пропускается", not any(verdicts[:main.FLOOD_LIMIT]))
+check("сверх лимита — флуд", verdicts[-1])
+check("чужой счётчик не задет", not main.flooding(who(CLIENT)))
+main.recent_messages.clear()
+
+
+# --- 20. Живые данные -----------------------------------------------------
+print("\n20. Живые данные")
 
 check("боевая база не тронута",
       (config.DB_FILE.stat().st_mtime if config.DB_FILE.exists() else None)

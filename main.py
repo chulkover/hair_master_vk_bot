@@ -118,39 +118,27 @@ def notify_partner(user_id, text):
         print(f"не смогла написать связанному аккаунту: {error}")
 
 
-def client_name(user_id):
-    """Имя клиента: «Мария Петрова» — или пустая строка, если не узнали.
-
-    Ссылка вида vk.com/id123456 мастеру не говорит ничего: чтобы понять, кто
-    записался, ему пришлось бы открывать её в браузере. Имя он видит сразу
-    в сообщении. Как именно его узнаём — дело мессенджера, см. user_name().
-    """
-    return bot.user_name(user_id)
-
-
 def name_and_link(target, reader):
-    """Имя человека `target`, кликабельное для того, кто это прочитает.
+    """Имя человека `target` со ссылкой на его страницу — для читателя `reader`.
 
-    В сообщении видно одно имя, и оно же открывает страницу — как ссылка
-    на сайте, а не адрес отдельной строкой рядом. Разметка у мессенджеров
-    разная, поэтому имя с адресом склеивает мессенджер получателя (reader),
-    см. Messenger.link().
+    Голый адрес вида vk.com/id123456 не говорит ничего, а одно имя не даёт
+    проверить, кто это. Склеивает их мессенджер получателя (reader), см.
+    Messenger.link(): у ВК кликабельно само имя, у остальных адрес рядом.
+    Через link() имя идёт всегда — он же чистит в нём служебные символы,
+    иначе чужое имя могло бы прикинуться ссылкой.
 
     Имя и короткое имя аккаунта, если мессенджер их не помнит, достаём
     из базы. Telegram отдаёт их только во входящем сообщении, а те живут
     в памяти процесса — после перезапуска бота вместо ссылки был бы виден
     голый номер. В базе они лежат с прошлых сообщений, см. remember_contact().
     """
-    known = db.get_contact(target.platform, target.id)
-    name = client_name(target) or (known["name"] if known else "")
-    handle = known["handle"] if known else ""
-
-    url = bot.user_link(target, handle)
-    if not url:
-        # Телеграм-аккаунт без @username: страницы, на которую вести, нет.
-        # Номер показываем только если и имени не знаем — иначе он лишний.
-        return name or f"{PLATFORM_NAMES[target.platform]} id {target.id}"
-    return bot.link(reader, name, url) if name else url
+    known = db.get_contact(target.platform, target.id) or {}
+    name = bot.user_name(target) or known.get("name", "")
+    url = bot.user_link(target, known.get("handle", ""))
+    if not name:
+        # Имени не знаем — покажем хотя бы адрес, а нет и его — номер.
+        return url or f"{PLATFORM_NAMES[target.platform]} id {target.id}"
+    return bot.link(reader, name, url)
 
 
 def client_card(user_id):
@@ -449,6 +437,12 @@ UNLINK_BUTTON = "Отвязать аккаунт"
 # на что отвечает.
 LINK_YES = "Да, это я"
 LINK_NO = "Нет, это не я"
+
+# Кому отказали в связке и когда: Client -> datetime. Без паузы после отказа
+# заявку можно было бы слать тому же человеку снова и снова. Держим в памяти,
+# а не в базе: перезапуск обнуляет паузу, но и случается он не каждую минуту.
+LINK_RETRY = timedelta(days=1)
+link_declined = {}
 
 # Отвязка необратима так же, как отмена записи — и подтверждаем её так же.
 UNLINK_YES = "Да, отвязать"
@@ -1058,10 +1052,7 @@ def save_booking(user_id):
         price_to=user["price_to"],
     )
 
-    if moving:
-        booking = schedule.move_booking(moving, **parameters)
-    else:
-        booking = schedule.create_booking(**parameters)
+    booking = schedule.create_booking(**parameters, move_id=moving)
 
     if booking is None:
         # Между показом кнопки и нажатием окошко заняли — обычное дело,
@@ -2658,6 +2649,13 @@ def start_link(user_id):
         show_profile(user_id)
         return
 
+    declined = link_declined.get(user_id)
+    if declined and datetime.now() - declined < LINK_RETRY:
+        send(user_id, "Прошлый запрос на связку отклонили. Новый можно "
+                      "отправить через сутки после отказа.")
+        show_profile(user_id)
+        return
+
     get_user(user_id)["state"] = LINK_HANDLE
     send(user_id,
          f"Связка работает, только если вы уже писали этому боту и здесь, "
@@ -2677,7 +2675,10 @@ def do_link(user_id, text):
     # Главная проверка: человека, который боту не писал, мы не знаем даже
     # по номеру — значит, и запрос ему не отправим. Прерываемся здесь.
     if found is None:
-        send(user_id, f"К сожалению, сообщение от пользователя {handle} "
+        # Обрезаем: прислать могли что угодно, а повторять простыню целиком
+        # незачем — да и сообщение длиннее лимита мессенджер не пропустит.
+        # Настоящие короткие имена в ВК и Telegram не длиннее 32 знаков.
+        send(user_id, f"К сожалению, сообщение от пользователя {handle[:40]} "
                       f"не найдено.\n\n"
                       f"Проверьте имя и убедитесь, что с того аккаунта "
                       f"боту в {PLATFORM_NAMES[other]} уже писали.")
@@ -2700,12 +2701,13 @@ def do_link(user_id, text):
              f"Связать с вами аккаунт {PLATFORM_NAMES[user_id.platform]} "
              f"хочет: {name_and_link(user_id, target)}\n\n"
              f"Подтверждаем? После связки записи и подписки станут общими: "
-             f"их будет видно и здесь, и в {PLATFORM_NAMES[user_id.platform]}.",
+             f"их будет видно и здесь, и в {PLATFORM_NAMES[user_id.platform]}, "
+             f"и оттуда же их можно будет отменить.\n\n"
+             f"⚠️ Если это не ваш второй аккаунт — нажмите «{LINK_NO}».",
              build_keyboard([[LINK_YES], [LINK_NO]]))
 
-    name = found["name"] or handle
-    send(user_id, f"Запрос отправлен пользователю {name} "
-                  f"в {PLATFORM_NAMES[other]}. Ждём подтверждения.")
+    send(user_id, f"Запрос отправлен: {name_and_link(target, user_id)}\n\n"
+                  f"Ждём подтверждения.")
     show_menu(user_id)
 
 
@@ -2734,6 +2736,7 @@ def do_link_answer(user_id, agreed):
                     f"общие.", menu_keyboard(asker))
     else:
         db.drop_links(user_id.platform, user_id.id)
+        link_declined[asker] = datetime.now()
         send(user_id, "Хорошо, аккаунты не связаны.")
         send(asker, f"Связку отклонил: {who}", menu_keyboard(asker))
 
@@ -3069,6 +3072,28 @@ def handle_message(user_id, text):
 # 12. Точка входа: бесконечное прослушивание сообщений
 # =========================================================================
 
+# Больше FLOOD_LIMIT сообщений за FLOOD_SECONDS руками не набрать — это скрипт.
+FLOOD_LIMIT = 10
+FLOOD_SECONDS = 10
+recent_messages = {}  # Client -> моменты последних сообщений
+
+
+def flooding(client):
+    """True, если человек пишет чаще, чем это возможно руками.
+
+    Каждое сообщение — это ответ через API мессенджера, а лимит запросов
+    у API один на всё сообщество. Скрипт, засыпающий бота сообщениями, выбрал
+    бы его целиком, и бот замолчал бы для всех. Лишнее поэтому пропускаем
+    молча: ответ на флуд — тоже запрос к тому же API.
+    """
+    now = time.monotonic()
+    moments = [moment for moment in recent_messages.get(client, ())
+               if now - moment < FLOOD_SECONDS]
+    moments.append(now)
+    recent_messages[client] = moments
+    return len(moments) > FLOOD_LIMIT
+
+
 # База открывается здесь, в главном потоке, до всего остального. Не ради
 # скорости: connect() сверяет версию схемы и на чужой базе останавливает бота
 # понятным текстом. Сделай это первым фоновый поток — SystemExit убил бы
@@ -3092,7 +3117,12 @@ if __name__ == "__main__":
           f"({config.TIMEZONE}), база {db.DB_FILE}. Ctrl+C — остановить.")
 
     for message in bot.listen():
-        print(f"[{message.client.platform}:{message.client.id}] {message.text}")
+        # !r — текст в кавычках, с видимыми \n и \x1b: присланные управляющие
+        # символы не перекрасят консоль и не подделают соседние строки лога.
+        print(f"[{message.client.platform}:{message.client.id}] {message.text!r}")
+
+        if flooding(message.client):
+            continue
 
         # До замка: в ВК это сетевой запрос, и держать из-за него замок,
         # пока фоновый поток ждёт своей очереди, незачем. Своя try/except —

@@ -89,6 +89,11 @@ check("link() чужой адрес оставляет как есть",
 check("служебные символы имени не ломают разметку",
       vk.link("А|Б]В", "https://vk.com/id201") == "[id201|А/Б)В]",
       vk.link("А|Б]В", "https://vk.com/id201"))
+check("имя из Telegram не подделает упоминание ВК",
+      vk.link("[club1|Оплатить]", "https://t.me/x")
+      == "(club1/Оплатить) — https://t.me/x",
+      vk.link("[club1|Оплатить]", "https://t.me/x"))
+check("и без адреса тоже", vk.link("[id1|Админ]", "") == "(id1/Админ)")
 
 from vk_api import longpoll as vk_longpoll
 vk_longpoll.EVENTS[:] = [
@@ -165,20 +170,16 @@ check("отправитель запомнен", tg.contact(401) == ("Анна",
 check("user_link() теперь по username", tg.user_link(401) == "https://t.me/anna_k")
 check("своё имя из сообщения важнее подсказки",
       tg.user_link(401, "d_chul") == "https://t.me/anna_k")
-check("link() — html-тег со ссылкой",
-      tg.link("Анна", "https://t.me/anna_k")
-      == '<a href="https://t.me/anna_k">Анна</a>', tg.link("Анна", "https://t.me/anna_k"))
-check("угловые скобки в имени экранируются",
-      tg.link("А<Б>", "https://t.me/anna_k")
-      == '<a href="https://t.me/anna_k">А&lt;Б&gt;</a>', tg.link("А<Б>", "https://t.me/anna_k"))
+check("link() — имя и адрес простым текстом",
+      tg.link("Анна", "https://t.me/anna_k") == "Анна — https://t.me/anna_k",
+      tg.link("Анна", "https://t.me/anna_k"))
+check("link() без адреса — одно имя", tg.link("Анна", "") == "Анна")
 
+# Присланный тег не должен превращаться в ссылку: разметку не включаем никогда.
 requests.HANDLER = lambda url, params: {"ok": True, "result": []}
-tg.send(111, "обычный текст")
-check("без ссылки разметку не включаем",
+tg.send(111, '<a href="https://evil.example">Оплатить</a>')
+check("разметка не включается даже с тегом в тексте",
       "parse_mode" not in requests.SENT[-1]["json"])
-tg.send(111, f'Клиент: {tg.link("Анна", "https://t.me/anna_k")}')
-check("со ссылкой включается parse_mode HTML",
-      requests.SENT[-1]["json"].get("parse_mode") == "HTML")
 check("offset сдвинулся за последнее из пачки", tg._offset == 3)
 
 

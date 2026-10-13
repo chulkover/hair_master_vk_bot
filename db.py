@@ -529,12 +529,12 @@ def linked_identities(platform, user_id):
         (platform, user_id, platform, user_id),
     )
 
-    identities = [(platform, user_id)]
+    me = (platform, user_id)
+    identities = [me]
     for row in rows:
-        for side in (("a_platform", "a_id"), ("b_platform", "b_id")):
-            pair = (row[side[0]], row[side[1]])
-            if pair != (platform, user_id):
-                identities.append(pair)
+        # Из пары берём ту сторону, что не мы.
+        a = (row["a_platform"], row["a_id"])
+        identities.append((row["b_platform"], row["b_id"]) if a == me else a)
     return identities
 
 

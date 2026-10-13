@@ -110,30 +110,33 @@ def number_setting(section, key):
 TOKEN_FILE = HERE / setting("community", "token_file")
 
 
-def read_token():
-    """Ключ доступа сообщества: из переменной окружения или из файла.
+def read_token(variable, file, missing):
+    """Ключ из переменной окружения `variable` или из файла `file`.
 
     Переменная важнее файла: файл с ключом лежит в `.gitignore`, поэтому
     на хостинг, куда код приезжает через git, он не попадёт — там ключ
-    задаётся только переменной VK_TOKEN. Файл остаётся для запуска
-    на своём компьютере.
+    задаётся только переменной. Файл остаётся для запуска на своём
+    компьютере. Правило одно для всех мессенджеров, отличается только
+    первая строка жалобы (`missing`), если ключа нет нигде.
     """
-    token = os.environ.get("VK_TOKEN", "").strip()
+    token = os.environ.get(variable, "").strip()
     if token:
         return token
 
-    if TOKEN_FILE.exists():
-        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    if file.exists():
+        return file.read_text(encoding="utf-8").strip()
 
     raise SystemExit(
-        "Не нашла ключ доступа сообщества.\n"
-        f"На своём компьютере: положите его в {TOKEN_FILE.name} рядом с кодом "
-        f"(имя файла задано в {SETTINGS_FILE.name}).\n"
-        "На хостинге: задайте переменную окружения VK_TOKEN."
+        f"{missing}\n"
+        f"На своём компьютере: положите его в {file.name} рядом с кодом.\n"
+        f"На хостинге: задайте переменную окружения {variable}."
     )
 
 
-VK_TOKEN = read_token()
+VK_TOKEN = read_token(
+    "VK_TOKEN", TOKEN_FILE,
+    f"Не нашла ключ доступа сообщества (имя файла задано в {SETTINGS_FILE.name})."
+)
 
 
 # --- Ключ Telegram-бота ---------------------------------------------------
@@ -144,29 +147,17 @@ TG_TOKEN_FILE = HERE / "tg_token.txt"
 
 
 def read_tg_token():
-    """Ключ Telegram-бота: из переменной окружения или из файла.
+    """Ключ Telegram-бота — по тому же правилу, что и у ВК, см. read_token().
 
     В отличие от VK_TOKEN читаем не при импорте, а по требованию — только когда
     Telegram включён в [bot] platform (см. messenger.create()). У чисто ВК-
     установки файла с TG-ключом нет, и заставлять её заводить его на старте
     незачем.
-
-    Правило то же, что у ВК: TG_TOKEN важнее файла. Код на хостинг приезжает
-    через git, tg_token.txt туда не попадает, поэтому там ключ задаётся только
-    переменной; файл остаётся для запуска на своём компьютере.
     """
-    token = os.environ.get("TG_TOKEN", "").strip()
-    if token:
-        return token
-
-    if TG_TOKEN_FILE.exists():
-        return TG_TOKEN_FILE.read_text(encoding="utf-8").strip()
-
-    raise SystemExit(
-        "Не нашла ключ Telegram-бота, а он включён в [bot] platform.\n"
-        f"На своём компьютере: положите его в {TG_TOKEN_FILE.name} рядом с кодом.\n"
-        "На хостинге: задайте переменную окружения TG_TOKEN.\n"
-        "Ключ выдаёт @BotFather. В git его класть нельзя."
+    return read_token(
+        "TG_TOKEN", TG_TOKEN_FILE,
+        "Не нашла ключ Telegram-бота, а он включён в [bot] platform "
+        "(ключ выдаёт @BotFather, в git его класть нельзя)."
     )
 
 

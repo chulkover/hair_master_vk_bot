@@ -374,8 +374,9 @@ check("without() убирает ровно одну запись",
 check("without(None) не меняет список",
       schedule.without([{"id": 1}], None) == [{"id": 1}])
 
-fresh = schedule.move_booking(moved["id"], "vk",MOVER, OTHER_DAY, "12:00", 90,
-                              "cold", "short", "thin", 2100, 2400)
+fresh = schedule.create_booking("vk",MOVER, OTHER_DAY, "12:00", 90,
+                              "cold", "short", "thin", 2100, 2400,
+                              move_id=moved["id"])
 check("перенос состоялся", fresh is not None)
 check("у новой записи свой номер", fresh and fresh["id"] != moved["id"])
 check("старая помечена MOVED",
@@ -384,19 +385,23 @@ check("MOVED время не занимает", "10:00" in schedule.free_slots(M
 check("активная запись одна", schedule.active_count("vk",MOVER) == 1)
 
 check("дважды перенести ту же запись нельзя",
-      schedule.move_booking(moved["id"], "vk",MOVER, MOVE_DAY, "10:00", 90, "cold",
-                            "short", "thin", 2100, 2400) is None)
+      schedule.create_booking("vk",MOVER, MOVE_DAY, "10:00", 90, "cold",
+                            "short", "thin", 2100, 2400,
+                              move_id=moved["id"]) is None)
 check("чужую запись перенести нельзя",
-      schedule.move_booking(fresh["id"], "vk",MOVER + 1, MOVE_DAY, "10:00", 90,
-                            "cold", "short", "thin", 2100, 2400) is None)
+      schedule.create_booking("vk",MOVER + 1, MOVE_DAY, "10:00", 90,
+                            "cold", "short", "thin", 2100, 2400,
+                              move_id=fresh["id"]) is None)
 check("за конец рабочего дня не переносит",
-      schedule.move_booking(fresh["id"], "vk",MOVER, OTHER_DAY, "19:30", 90,
-                            "cold", "short", "thin", 2100, 2400) is None)
+      schedule.create_booking("vk",MOVER, OTHER_DAY, "19:30", 90,
+                            "cold", "short", "thin", 2100, 2400,
+                              move_id=fresh["id"]) is None)
 check("после неудачи запись осталась активной",
       schedule.get_booking(fresh["id"])["status"] in schedule.ACTIVE_STATUSES)
 
-inside = schedule.move_booking(fresh["id"], "vk",MOVER, OTHER_DAY, "12:30", 90,
-                               "cold", "short", "thin", 2100, 2400)
+inside = schedule.create_booking("vk",MOVER, OTHER_DAY, "12:30", 90,
+                               "cold", "short", "thin", 2100, 2400,
+                              move_id=fresh["id"])
 check("перенос внутри дня на соседнее время", inside is not None)
 check("и он действительно сдвинул", inside and inside["start"] == "12:30")
 

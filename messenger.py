@@ -20,7 +20,6 @@ main.py разговаривает с клиентом одними и теми 
 """
 
 import collections
-import html
 import queue
 import re
 import threading
@@ -96,8 +95,12 @@ class Messenger:
         raise NotImplementedError
 
     def user_name(self, user_id):
-        """Имя пользователя строкой — или пустая строка, если не узнали."""
-        raise NotImplementedError
+        """Имя пользователя строкой — или пустая строка, если не узнали.
+
+        Общее для всех: имя — первая половина contact(). У ВК это свежий
+        ответ users.get, у Telegram — то, что человек сам прислал боту.
+        """
+        return self.contact(user_id)[0]
 
     def user_link(self, user_id, handle=""):
         """Адрес страницы пользователя — или пустая строка, если его нет.
@@ -113,13 +116,15 @@ class Messenger:
         raise NotImplementedError
 
     def link(self, name, url):
-        """Имя, по которому можно кликнуть, — как тег <a href> на сайте.
+        """Имя рядом с адресом его страницы: «Мария — https://t.me/masha».
 
-        В сообщении видно только имя, а открывается по нему адрес. Разметка
-        для этого у каждого мессенджера своя, поэтому склеивает имя с адресом
-        тот мессенджер, в котором сообщение будут читать.
+        Склеивает тот мессенджер, в котором сообщение будут читать: у ВК для
+        своих страниц есть разметка, где кликабельно само имя (см. VkMessenger).
+        Здесь — простой текст, который годится всем: адрес мессенджеры делают
+        кликабельным сами. Разметку вроде HTML не включаем намеренно — тогда
+        чужое имя или присланный текст с тегом стали бы ссылкой куда угодно.
         """
-        raise NotImplementedError
+        return f"{name} — {url}" if url else name
 
     def contact(self, user_id):
         """Имя и короткое имя аккаунта: («Мария Петрова», «chuul»).
@@ -230,15 +235,6 @@ class VkMessenger(Messenger):
             print(f"не смогла узнать данные {user_id}: {error}")
             return "", ""
 
-    def user_name(self, user_id):
-        """Имя клиента: «Мария Петрова» — или пустая строка, если не узнали.
-
-        Спрашиваем ВК при каждой отправке. Записей единицы в день, а держать
-        имена про запас незачем: в contacts они лежат для поиска по короткому
-        имени, а не чтобы показывать мастеру устаревшее.
-        """
-        return self.contact(user_id)[0]
-
     # Своя страница в разметке ВК — [id555|Мария Петрова]: показывается имя,
     # открывается страница. Работает это только для страниц самого ВК, поэтому
     # адрес сверяем с шаблоном, а не подставляем что придёт.
@@ -251,16 +247,15 @@ class VkMessenger(Messenger):
         return f"https://vk.com/id{user_id}"
 
     def link(self, name, url):
+        # Скобки и черта — служебные символы разметки ВК, и чистим их всегда,
+        # а не только внутри ссылки: имя из Telegram вида «[club1|Оплатить]»
+        # ВК иначе показал бы как ссылку на чужую страницу.
+        name = name.replace("[", "(").replace("]", ")").replace("|", "/")
         page = self.OWN_PAGE.fullmatch(url)
-        if not page:
-            # Чужой адрес (та же t.me) подписать нечем: разметка ВК умеет
-            # только свои страницы. Показываем имя и адрес рядом — сам адрес
-            # ВК сделает кликабельным.
-            return f"{name} — {url}"
-        # Скобки и черта — служебные символы этой разметки: попадись они
-        # в имени, ВК показал бы вместо ссылки кусок разметки.
-        clean = name.replace("[", "(").replace("]", ")").replace("|", "/")
-        return f"[{page.group(1)}|{clean}]"
+        if page:
+            return f"[{page.group(1)}|{name}]"
+        # Чужой адрес (та же t.me) разметка ВК подписать не умеет.
+        return super().link(name, url)
 
     def listen(self):
         for event in self._longpoll.listen():
@@ -325,22 +320,13 @@ class TgMessenger(Messenger):
             )
         return data["result"]
 
-    # По этому куску send() узнаёт сообщение со ссылкой из link().
-    LINK_TAG = '<a href="'
-
     def send(self, user_id, text, rows=None):
-        params = {
+        # Без parse_mode: текст уходит как есть, теги в нём остаются текстом.
+        self._call("sendMessage", {
             "chat_id": user_id,
             "text": text,
             "reply_markup": self._keyboard(rows),
-        }
-        # Разбор разметки включаем только там, где она правда есть. Включи его
-        # всегда — и Telegram начал бы искать теги в обычном тексте: любая
-        # угловая скобка в имени клиента или в причине отмены превращала бы
-        # отправку безобидного сообщения в ошибку.
-        if self.LINK_TAG in text:
-            params["parse_mode"] = "HTML"
-        self._call("sendMessage", params)
+        })
 
     def _keyboard(self, rows):
         """Ряды подписей -> reply-клавиатура Telegram (reply_markup для send).
@@ -363,11 +349,6 @@ class TgMessenger(Messenger):
         """
         return self._names.get(user_id, ("", ""))
 
-    def user_name(self, user_id):
-        # Только из того, что человек сам прислал (см. contact). Не писал
-        # боту — имени нет, вернём пустую строку: мастеру останется ссылка.
-        return self.contact(user_id)[0]
-
     def user_link(self, user_id, handle=""):
         # По числовому id ссылку на человека Telegram не даёт — нужен @username.
         # Свежий берём из входящего сообщения, а если бот с тех пор
@@ -376,12 +357,6 @@ class TgMessenger(Messenger):
         # и честнее отдать пустую строку, чем выдуманный адрес.
         username = self.contact(user_id)[1] or handle
         return f"https://t.me/{username}" if username else ""
-
-    def link(self, name, url):
-        # Телеграм подписывает ссылки html-тегом; parse_mode в send() включится
-        # сам, как увидит этот тег. Имя пропускаем через escape: угловая скобка
-        # или амперсанд внутри имени иначе сломали бы разбор всего сообщения.
-        return f'<a href="{url}">{html.escape(name)}</a>'
 
     def _remember(self, sender):
         """Запомнить имя и @username отправителя — из поля from входящего."""
