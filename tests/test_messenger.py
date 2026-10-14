@@ -6,8 +6,6 @@ vk_api и requests подменены заглушками из stub/: ни од
 
 import os
 import sys
-import threading
-import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -73,9 +71,9 @@ except MessengerError as error:
     check("но без подсказки", error.hint == "")
 vk_api.FAIL.clear()
 
-vk_api.PEOPLE[201] = ("Мария", "Петрова", "chuul")
+vk_api.PEOPLE[201] = ("Мария", "Петрова", "maria_vk")
 vk_api.PEOPLE[202] = ("Олег", "Иванов")  # без короткого имени
-check("contact() с доменом", vk.contact(201) == ("Мария Петрова", "chuul"))
+check("contact() с доменом", vk.contact(201) == ("Мария Петрова", "maria_vk"))
 check("contact() без домена — id-заглушка", vk.contact(202) == ("Олег Иванов", "id202"))
 check("contact() незнакомца — пусто", vk.contact(999) == ("", ""))
 check("user_name делегирует в contact", vk.user_name(201) == "Мария Петрова")
@@ -150,7 +148,7 @@ except MessengerError as error:
 check("contact() до первого сообщения — пусто", tg.contact(401) == ("", ""))
 check("user_link() без username — ссылки нет", tg.user_link(401) == "")
 check("user_link() берёт подсказанный username",
-      tg.user_link(401, "d_chul") == "https://t.me/d_chul")
+      tg.user_link(401, "maria_tg") == "https://t.me/maria_tg")
 
 requests.HANDLER = lambda url, params: {"ok": True, "result": [
     {"update_id": 1, "message": {"sticker": {}}},  # без текста — мимо, но offset двигает
@@ -169,7 +167,7 @@ check("listen() отдал только текстовое сообщение",
 check("отправитель запомнен", tg.contact(401) == ("Анна", "anna_k"))
 check("user_link() теперь по username", tg.user_link(401) == "https://t.me/anna_k")
 check("своё имя из сообщения важнее подсказки",
-      tg.user_link(401, "d_chul") == "https://t.me/anna_k")
+      tg.user_link(401, "maria_tg") == "https://t.me/anna_k")
 check("link() — имя и адрес простым текстом",
       tg.link("Анна", "https://t.me/anna_k") == "Анна — https://t.me/anna_k",
       tg.link("Анна", "https://t.me/anna_k"))
@@ -203,7 +201,7 @@ bot.send(Client("tg", 111), "tg-привет")
 check("bot.send() уехал в ВК", len(vk_api.SENT) == before_vk + 1)
 check("bot.send() уехал в Telegram", len(requests.SENT) == before_tg + 1)
 check("bot.contact() маршрутизируется", bot.contact(Client("vk", 201))
-      == ("Мария Петрова", "chuul"))
+      == ("Мария Петрова", "maria_vk"))
 check("bot.user_name() маршрутизируется", bot.user_name(Client("vk", 201))
       == "Мария Петрова")
 check("bot.user_link() маршрутизируется", bot.user_link(Client("tg", 401))
@@ -220,6 +218,28 @@ only_vk = Bot({"vk": vk})
 check("один мессенджер — поток без потоков", list(only_vk.listen())
       == [Incoming(Client("vk", 501), "один канал")])
 vk_longpoll.EVENTS.clear()
+
+
+class Flaky:
+    """Канал, у которого первый listen() обрывается, а второй работает."""
+    platform = "flaky"
+
+    def __init__(self):
+        self.calls = 0
+
+    def listen(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("сеть мигнула")
+        yield Incoming(Client("flaky", 1), "после обрыва")
+
+
+real_sleep, messenger.time.sleep = messenger.time.sleep, lambda seconds: None
+flaky = Flaky()
+check("обрыв единственного канала не роняет бота",
+      list(Bot({"flaky": flaky}).listen())
+      == [Incoming(Client("flaky", 1), "после обрыва")] and flaky.calls == 2)
+messenger.time.sleep = real_sleep
 
 # Несколько каналов: у ВК longpoll сразу отдаёт сообщение и замолкает, у TG —
 # бесконечный поток пустых ответов (как настоящий getUpdates). listen() должен

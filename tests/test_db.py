@@ -321,18 +321,18 @@ print("\n9. Контакты и связка аккаунтов")
 # Контакты: по ним потом ищут человека в другом мессенджере.
 check("незнакомый контакт -> None", db.get_contact("tg", 777) is None)
 
-db.save_contact("tg", 777, "Мария Петрова", "d_chul")
+db.save_contact("tg", 777, "Мария Петрова", "maria_tg")
 saved = db.get_contact("tg", 777)
 check("контакт сохранился", saved is not None)
 check("имя на месте", saved and saved["name"] == "Мария Петрова")
-check("handle на месте", saved and saved["handle"] == "d_chul")
+check("handle на месте", saved and saved["handle"] == "maria_tg")
 
 check("поиск по handle находит",
-      (db.find_contact("tg", "d_chul") or {}).get("user_id") == 777)
+      (db.find_contact("tg", "maria_tg") or {}).get("user_id") == 777)
 check("регистр в handle не важен",
-      (db.find_contact("tg", "D_Chul") or {}).get("user_id") == 777)
+      (db.find_contact("tg", "Maria_TG") or {}).get("user_id") == 777)
 check("в другом мессенджере тот же handle не находится",
-      db.find_contact("vk", "d_chul") is None)
+      db.find_contact("vk", "maria_tg") is None)
 check("пустой handle ничего не находит", db.find_contact("tg", "") is None)
 
 # Имя узнаётся не всегда: ВК может не ответить, @username человек мог убрать.
@@ -340,7 +340,7 @@ check("пустой handle ничего не находит", db.find_contact("t
 db.save_contact("tg", 777, "", "")
 kept = db.get_contact("tg", 777)
 check("пустое имя не затирает прежнее", kept["name"] == "Мария Петрова")
-check("пустой handle не затирает прежний", kept["handle"] == "d_chul")
+check("пустой handle не затирает прежний", kept["handle"] == "maria_tg")
 
 db.save_contact("tg", 777, "Мария Иванова", "masha")
 renamed = db.get_contact("tg", 777)
@@ -349,7 +349,7 @@ check("непустой handle обновляется", renamed["handle"] == "ma
 
 # Связка. Главное свойство: пока её нет, всё работает ровно как раньше —
 # список личностей состоит из одного человека, и запросы не меняются.
-db.save_contact("vk", 12345, "Мария Петрова", "chuul")
+db.save_contact("vk", 12345, "Мария Петрова", "maria_vk")
 
 alone = db.linked_identities("vk", 12345)
 check("без связки личность одна", alone == [("vk", 12345)], str(alone))

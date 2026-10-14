@@ -16,6 +16,7 @@
 """
 
 import os
+import sys
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -116,6 +117,14 @@ def notify_partner(user_id, text):
         send(partner, text, menu_keyboard(partner))
     except messenger.MessengerError as error:
         print(f"не смогла написать связанному аккаунту: {error}")
+        return
+
+    # Клавиатура у партнёра теперь от главного меню — значит, и диалог должен
+    # стоять там же. Иначе он, скажем, остался в «Моих записях», жмёт новую
+    # кнопку «Профиль» и получает «Не понял»: бот ждал номер записи.
+    forget_move(partner)
+    get_user(partner)["state"] = MAIN_MENU
+    save_user(partner)
 
 
 def name_and_link(target, reader):
@@ -311,7 +320,7 @@ def remember_contact(client):
     """Отметить, что человек нам писал: имя и короткое имя его аккаунта.
 
     Без этой отметки не работает связка аккаунтов: когда человек пришлёт
-    «@d_chul» или «vk.com/chuul», найти по такому имени номер можно только
+    «@maria_tg» или «vk.com/maria_vk», найти по такому имени номер можно только
     у себя — мессенджеры чужой номер по имени не отдают. Отсюда же берётся
     ответ «сообщение от такого пользователя не найдено».
 
@@ -2582,8 +2591,8 @@ def other_platform(platform):
 def parse_handle(text):
     """Из того, что прислал человек, вытащить короткое имя аккаунта.
 
-    Принимаем всё, чем люди называют свою страницу: «@d_chul», «d_chul»,
-    «t.me/d_chul», «https://vk.com/chuul», «vk.ru/chuul», «vk.com/id12345».
+    Принимаем всё, чем люди называют свою страницу: «@maria_tg», «maria_tg»,
+    «t.me/maria_tg», «https://vk.com/maria_vk», «vk.ru/maria_vk», «vk.com/id12345».
     Просить «пришлите строго в таком формате» бессмысленно — пришлют как
     привыкли, а бот должен понять.
 
@@ -2671,6 +2680,13 @@ def do_link(user_id, text):
     other = other_platform(user_id.platform)
     handle = parse_handle(text)
     found = db.find_contact(other, handle)
+
+    # «vk.com/id12345» открывает страницу и тогда, когда у неё есть короткое
+    # имя, — а в contacts лежит именно оно («maria_vk»). Поэтому по такой ссылке
+    # ищем ещё и прямо по номеру.
+    if found is None and other == "vk" and handle.lower().startswith("id") \
+            and handle[2:].isdigit():
+        found = db.get_contact("vk", int(handle[2:]))
 
     # Главная проверка: человека, который боту не писал, мы не знаем даже
     # по номеру — значит, и запрос ему не отправим. Прерываемся здесь.
@@ -2774,8 +2790,10 @@ def handle_message(user_id, text):
     # нажать кнопку из вчерашнего сообщения, а бот с тех пор ушёл в другое
     # состояние. Плюс фоновые напоминания приходят когда им пора, посреди
     # любого шага. Поэтому выходы в разделы работают откуда угодно.
-    if msg in ("привет", "начать", "старт", "меню", BACK_TO_MENU.lower()):
-        show_menu(user_id, greeting=msg in ("привет", "начать", "старт"))
+    # «/start» — то, что шлёт кнопка «Старт» в Telegram и меню команд бота.
+    greetings = ("привет", "начать", "старт", "/start")
+    if msg in greetings or msg in ("меню", BACK_TO_MENU.lower()):
+        show_menu(user_id, greeting=msg in greetings)
         return
 
     if msg == CONFIRM_COMING.lower():
@@ -3000,7 +3018,7 @@ def handle_message(user_id, text):
         # строку, а искать по ней нечего.
         if not parse_handle(text):
             send(user_id, "Не похоже на ссылку или имя аккаунта. "
-                          "Пришлите, например, vk.com/chuul или @d_chul:")
+                          "Пришлите, например, vk.com/maria_vk или @maria_tg:")
             return
         do_link(user_id, text)
         return
@@ -3107,6 +3125,15 @@ db.connect()
 # listen() ждёт очередь и висел бы. Поэтому запуск прячем за __main__, а
 # db.connect() выше оставляем на импорте: на нём тесты создают схему в своей базе.
 if __name__ == "__main__":
+    # Две настройки вывода, без которых бот в работе подводит:
+    #   errors — символ, которого нет в кодировке консоли (эмодзи в консоли
+    #     Windows), печатается как \U0001f600, а не роняет бота ошибкой
+    #     UnicodeEncodeError: «👍» от клиента иначе останавливал всё;
+    #   line_buffering — каждая строка уходит в лог сразу. Когда вывод идёт
+    #     не в окно, а в файл или журнал хостинга, Python копит его кусками,
+    #     и после падения последних строк — самых нужных — в логе нет.
+    sys.stdout.reconfigure(errors="backslashreplace", line_buffering=True)
+
     # daemon=True — поток не мешает боту завершиться: по Ctrl+C процесс закроется,
     # не дожидаясь, пока планировщик доспит свою минуту.
     threading.Thread(target=run_scheduler, daemon=True).start()

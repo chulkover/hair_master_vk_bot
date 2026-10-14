@@ -558,20 +558,20 @@ check("и он ничего не закрыл", schedule.all_closures() == [])
 print("\n16. Контакт запоминается")
 
 # Без этой отметки не заработает связка аккаунтов: найти человека по
-# «vk.com/chuul» можно только у себя — ВК по домену чужой номер не отдаёт.
-vk_api.PEOPLE[CLIENT] = ("Мария", "Петрова", "chuul")
+# «vk.com/maria_vk» можно только у себя — ВК по домену чужой номер не отдаёт.
+vk_api.PEOPLE[CLIENT] = ("Мария", "Петрова", "maria_vk")
 db.execute("DELETE FROM contacts")
 
 main.remember_contact(who(CLIENT))
 noted = db.get_contact("vk", CLIENT)
 check("контакт записан", noted is not None)
 check("имя из ВК", noted and noted["name"] == "Мария Петрова")
-check("домен из ВК", noted and noted["handle"] == "chuul")
+check("домен из ВК", noted and noted["handle"] == "maria_vk")
 check("человек находится по домену",
-      (db.find_contact("vk", "chuul") or {}).get("user_id") == CLIENT)
+      (db.find_contact("vk", "maria_vk") or {}).get("user_id") == CLIENT)
 
 # Домен известен и день сегодняшний — второй раз ВК не дёргаем.
-vk_api.PEOPLE[CLIENT] = ("Мария", "Иванова", "chuul")
+vk_api.PEOPLE[CLIENT] = ("Мария", "Иванова", "maria_vk")
 main.remember_contact(who(CLIENT))
 check("за день повторно ВК не спрашиваем",
       db.get_contact("vk", CLIENT)["name"] == "Мария Петрова")
@@ -604,7 +604,7 @@ class FakeTg:
         self.sent.append((user_id, text))
 
     def contact(self, user_id):
-        return ("Мария Т", "d_chul")
+        return ("Мария Т", "maria_tg")
 
     def user_name(self, user_id):
         return self.contact(user_id)[0]
@@ -622,8 +622,8 @@ main.bot._messengers["tg"] = fake_tg
 TG = main.Client("tg", 777)
 
 db.execute("DELETE FROM links")
-db.save_contact("vk", CLIENT, "Мария Петрова", "chuul")
-db.save_contact("tg", 777, "Мария Т", "d_chul")
+db.save_contact("vk", CLIENT, "Мария Петрова", "maria_vk")
+db.save_contact("tg", 777, "Мария Т", "maria_tg")
 
 msg(main.PROFILE_BUTTON)
 check("профиль открылся", state() == main.PROFILE)
@@ -643,7 +643,7 @@ check("заявки не завели", db.link_for("vk", CLIENT) is None)
 
 # А знакомого — находим по ссылке t.me/…
 msg(main.LINK_BUTTON)
-msg("https://t.me/d_chul")
+msg("https://t.me/maria_tg")
 check("заявка заведена", (db.link_for("vk", CLIENT) or {}).get("status")
       == "PENDING")
 check("запрос ушёл в Telegram", len(fake_tg.sent) == 1)
@@ -661,7 +661,7 @@ check("после «Да» аккаунты связаны", linked == [("vk", C
       str(linked))
 check("инициатору сообщили",
       "Связку подтвердил" in vk_api.SENT[-1]["message"]
-      and "t.me/d_chul" in vk_api.SENT[-1]["message"],
+      and "t.me/maria_tg" in vk_api.SENT[-1]["message"],
       vk_api.SENT[-1]["message"])
 
 # Второй раз связать нельзя: одна связка на аккаунт.
@@ -690,7 +690,7 @@ check("второму аккаунту сообщили об отвязке",
 # Отказ: заявка исчезает, связки нет.
 msg(main.PROFILE_BUTTON)
 msg(main.LINK_BUTTON)
-msg("@d_chul")
+msg("@maria_tg")
 main.handle_message(TG, main.LINK_NO)
 check("после «Нет» связки нет",
       db.linked_identities("vk", CLIENT) == [("vk", CLIENT)])
@@ -710,9 +710,9 @@ check("длинный текст в ответе обрезан",
       "не найдено" in answers[0] and len(answers[0]) < 1000, str(answers)[:200])
 
 check("разбор ссылок", [main.parse_handle(t) for t in
-                        ("@d_chul", "vk.com/chuul", "https://vk.ru/chuul/",
-                         "t.me/d_chul", "vk.com/id555")]
-      == ["d_chul", "chuul", "chuul", "d_chul", "id555"])
+                        ("@maria_tg", "vk.com/maria_vk", "https://vk.ru/maria_vk/",
+                         "t.me/maria_tg", "vk.com/id555")]
+      == ["maria_tg", "maria_vk", "maria_vk", "maria_tg", "id555"])
 
 del main.bot._messengers["tg"]
 db.execute("DELETE FROM links")
@@ -729,8 +729,8 @@ for old in schedule.user_bookings("vk", CLIENT):
 fake_tg = FakeTg()
 main.bot._messengers["tg"] = fake_tg
 db.execute("DELETE FROM links")
-db.save_contact("vk", CLIENT, "Мария Петрова", "chuul")
-db.save_contact("tg", 777, "Мария Т", "d_chul")
+db.save_contact("vk", CLIENT, "Мария Петрова", "maria_vk")
+db.save_contact("tg", 777, "Мария Т", "maria_tg")
 db.add_link_request("vk", CLIENT, "tg", 777)
 db.confirm_link("vk", CLIENT, "tg", 777)
 
@@ -745,14 +745,31 @@ check("связанному Telegram пришло уведомление о за
 
 booking = schedule.user_bookings("vk", CLIENT)[0]
 main.get_user(who(CLIENT))["cancel_id"] = booking["id"]
+partner = main.messenger.Client("tg", 777)
+main.get_user(partner)["state"] = main.MY_BOOKINGS   # партнёр смотрел свои записи
 fake_tg.sent.clear()
 main.do_cancel(who(CLIENT))
 check("связанному Telegram пришло уведомление об отмене",
       len(fake_tg.sent) == 1 and "Через ВКонтакте отменена запись"
       in fake_tg.sent[-1][1], str(fake_tg.sent))
+check("у партнёра диалог вернулся в главное меню вместе с клавиатурой",
+      main.get_user(partner)["state"] == main.MAIN_MENU)
+
+# Из Telegram присылают ссылку ВК по номеру, хотя у страницы есть короткое
+# имя «maria_vk», под которым она и лежит в contacts. Найти всё равно должны.
+db.execute("DELETE FROM links")
+main.do_link(partner, f"https://vk.com/id{CLIENT}")
+check("ссылка vk.com/idN находит страницу с коротким именем",
+      (db.link_for("tg", 777) or {}).get("status") == "PENDING", str(fake_tg.sent[-2:]))
 
 del main.bot._messengers["tg"]
 db.execute("DELETE FROM links")
+
+# /start из Telegram посреди диалога — не «Не понял», а приветствие и меню.
+main.get_user(who(CLIENT))["state"] = main.PROFILE
+reply = msg("/start")
+check("/start посреди диалога возвращает в меню с приветствием",
+      state() == main.MAIN_MENU and reply and reply[-1].startswith("Привет!"), str(reply))
 
 
 # --- 19. Защита от флуда ----------------------------------------------------

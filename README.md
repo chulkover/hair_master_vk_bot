@@ -224,7 +224,7 @@ platform = vk, tg
 
 [community]
 token_file = token.txt
-owner_id = 203719182
+owner_id = 123456789
 
 [salon]
 address = г. Пенза, ул. Московская, д. 999А

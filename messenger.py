@@ -127,11 +127,11 @@ class Messenger:
         return f"{name} — {url}" if url else name
 
     def contact(self, user_id):
-        """Имя и короткое имя аккаунта: («Мария Петрова», «chuul»).
+        """Имя и короткое имя аккаунта: («Мария Петрова», «maria_vk»).
 
         Короткое имя — то, чем человека называют вместо номера: @username
         в Telegram, домен страницы в ВК. Нужно для связки аккаунтов: человек
-        присылает «vk.com/chuul» или «@d_chul», и найти по такому имени номер
+        присылает «vk.com/maria_vk» или «@maria_tg», и найти по такому имени номер
         мы можем только у себя — мессенджеры по чужому имени номер не выдают.
 
         Что не узнали, отдаём пустой строкой, а не ошибкой: не знать имя
@@ -217,7 +217,7 @@ class VkMessenger(Messenger):
         return keyboard.get_keyboard()
 
     def contact(self, user_id):
-        """Имя и домен страницы: («Мария Петрова», «chuul»). Спрашиваем ВК.
+        """Имя и домен страницы: («Мария Петрова», «maria_vk»). Спрашиваем ВК.
 
         Домен — то, что стоит в адресе страницы после vk.com. У страницы,
         которой короткое имя не задавали, он выглядит как «id12345» — и это
@@ -452,22 +452,31 @@ class Bot:
     def contact(self, client):
         return self.by(client.platform).contact(client.id)
 
-    def _pump(self, channel, box):
-        """Слушать один канал и складывать входящие в общую очередь `box`.
+    @staticmethod
+    def _retrying(channel):
+        """Входящие одного канала — переживающие обрывы.
 
-        Крутится в своём потоке — по одному на канал. Если listen() оборвётся
-        (сбой сети, ошибка библиотеки), не роняем весь бот и не гасим канал
-        молча: жалуемся в консоль, ждём и слушаем заново. Иначе один упавший
-        канал незаметно перестал бы принимать сообщения.
+        Если listen() оборвётся (сбой сети, ошибка библиотеки), не роняем
+        весь бот и не гасим канал молча: жалуемся в консоль, ждём и слушаем
+        заново. Это нужно при любом числе каналов: с одним ВК обрыв longpoll
+        иначе долетал бы до главного цикла и останавливал бота целиком.
+
+        Закончиться сам по себе listen() может только у заглушки в тестах —
+        тогда и мы заканчиваем, а не крутимся вечно.
         """
         while True:
             try:
-                for message in channel.listen():
-                    box.put(message)
+                yield from channel.listen()
+                return
             except Exception as error:
                 print(f"канал «{channel.platform}» оборвался: {error}; "
                       f"повтор через 5 c")
                 time.sleep(5)
+
+    def _pump(self, channel, box):
+        """Слушать один канал в своём потоке и складывать входящие в `box`."""
+        for message in self._retrying(channel):
+            box.put(message)
 
     def listen(self):
         """Входящие сообщения всех включённых мессенджеров, одной лентой.
@@ -483,7 +492,7 @@ class Bot:
         """
         if len(self._messengers) == 1:
             (only,) = self._messengers.values()
-            yield from only.listen()
+            yield from self._retrying(only)
             return
 
         box = queue.Queue()
